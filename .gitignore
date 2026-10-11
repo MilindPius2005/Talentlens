@@ -1,0 +1,55 @@
+# Node dependencies
+node_modules
+node_modules/
+*/node_modules/
+
+# Production builds
+dist
+dist/
+dist-ssr/
+*.local
+
+# Environment variables & secrets
+.env
+.env.*
+*.env
+.env.example
+*.env.example
+
+# Python virtual environments
+venv
+venv/
+.venv
+.venv/
+env/
+*/venv/
+*/.venv/
+
+# Python bytecode & cache
+*pycache*
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*DS_store*
+*DS_Store*
+
+# EOF temporary / marker files
+EOF
+*EOF*
+
+# Logs & build info
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.tsbuildinfo

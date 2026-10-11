@@ -1,0 +1,277 @@
+[
+  {
+    "id": "E001",
+    "name": "Priya Sharma",
+    "status": "AVAILABLE",
+    "available_since": "2026-05-05",
+    "location": "Bangalore",
+    "skills": [
+      {
+        "id": "SK_REACT",
+        "name": "React",
+        "prof": 5
+      },
+      {
+        "id": "SK_NODE",
+        "name": "Node.js",
+        "prof": 4
+      },
+      {
+        "id": "SK_AWS",
+        "name": "AWS",
+        "prof": 3
+      },
+      {
+        "id": "SK_TS",
+        "name": "TypeScript",
+        "prof": 4
+      }
+    ],
+    "softblock_job": null,
+    "softblock_manager": null,
+    "softblock_start": null,
+    "softblock_expiry": null,
+    "interviews": [
+      {
+        "id": "I001",
+        "client": "Acme Corp",
+        "round": 1,
+        "result": "REJECTED",
+        "date": "2026-06-01",
+        "feedback": {
+          "id": "F001",
+          "sentiment": "mixed",
+          "rec": "no",
+          "gaps": [
+            {
+              "id": "SK_SYSDES",
+              "name": "System Design",
+              "severity": "high"
+            }
+          ],
+          "strengths": [
+            "React",
+            "TypeScript"
+          ]
+        }
+      },
+      {
+        "id": "I002",
+        "client": "TechCo",
+        "round": 1,
+        "result": "PASSED",
+        "date": "2026-06-15",
+        "feedback": {
+          "id": "F002",
+          "sentiment": "positive",
+          "rec": "yes",
+          "gaps": [],
+          "strengths": [
+            "React",
+            "Node.js"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "E002",
+    "name": "Arjun Mehta",
+    "status": "AVAILABLE",
+    "available_since": "2026-05-20",
+    "location": "Mumbai",
+    "skills": [
+      {
+        "id": "SK_PYTHON",
+        "name": "Python",
+        "prof": 5
+      },
+      {
+        "id": "SK_ML",
+        "name": "ML",
+        "prof": 4
+      },
+      {
+        "id": "SK_AWS",
+        "name": "AWS",
+        "prof": 4
+      },
+      {
+        "id": "SK_FASTAPI",
+        "name": "FastAPI",
+        "prof": 3
+      }
+    ],
+    "softblock_job": null,
+    "softblock_manager": null,
+    "softblock_start": null,
+    "softblock_expiry": null,
+    "interviews": [
+      {
+        "id": "I003",
+        "client": "DataCorp",
+        "round": 1,
+        "result": "REJECTED",
+        "date": "2026-06-10",
+        "feedback": {
+          "id": "F003",
+          "sentiment": "negative",
+          "rec": "no",
+          "gaps": [
+            {
+              "id": "SK_AWS",
+              "name": "AWS",
+              "severity": "medium"
+            },
+            {
+              "id": "SK_SYSDES",
+              "name": "System Design",
+              "severity": "high"
+            }
+          ],
+          "strengths": [
+            "Python",
+            "ML"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "E003",
+    "name": "Meera Nair",
+    "status": "TRAINING",
+    "available_since": "2026-05-15",
+    "location": "Remote",
+    "skills": [
+      {
+        "id": "SK_REACT",
+        "name": "React",
+        "prof": 4
+      },
+      {
+        "id": "SK_VUE",
+        "name": "Vue.js",
+        "prof": 4
+      },
+      {
+        "id": "SK_CSS",
+        "name": "CSS",
+        "prof": 5
+      },
+      {
+        "id": "SK_NODE",
+        "name": "Node.js",
+        "prof": 3
+      }
+    ],
+    "softblock_job": null,
+    "softblock_manager": null,
+    "softblock_start": null,
+    "softblock_expiry": null,
+    "interviews": []
+  },
+  {
+    "id": "E004",
+    "name": "Ravi Kumar",
+    "status": "SOFTBLOCKED",
+    "available_since": "2026-06-01",
+    "location": "Pune",
+    "skills": [
+      {
+        "id": "SK_JAVA",
+        "name": "Java",
+        "prof": 5
+      },
+      {
+        "id": "SK_SPRING",
+        "name": "Spring Boot",
+        "prof": 4
+      },
+      {
+        "id": "SK_K8S",
+        "name": "Kubernetes",
+        "prof": 3
+      }
+    ],
+    "softblock_job": "Senior Frontend Developer @ Acme Corp",
+    "softblock_manager": "Test Manager",
+    "softblock_start": "2026-08-28",
+    "softblock_expiry": "2026-09-12",
+    "interviews": []
+  },
+  {
+    "id": "E005",
+    "name": "Aisha Patel",
+    "status": "AVAILABLE",
+    "available_since": "2026-04-10",
+    "location": "Bangalore",
+    "skills": [
+      {
+        "id": "SK_SQL",
+        "name": "SQL",
+        "prof": 3
+      },
+      {
+        "id": "SK_AGILE",
+        "name": "Agile",
+        "prof": 4
+      }
+    ],
+    "softblock_job": null,
+    "softblock_manager": null,
+    "softblock_start": null,
+    "softblock_expiry": "2026-09-12",
+    "interviews": [
+      {
+        "id": "I004",
+        "client": "StartupX",
+        "round": 1,
+        "result": "REJECTED",
+        "date": "2026-05-20",
+        "feedback": {
+          "id": "F004",
+          "sentiment": "mixed",
+          "rec": "no",
+          "gaps": [
+            {
+              "id": "SK_AGILE",
+              "name": "Technical depth",
+              "severity": "medium"
+            }
+          ],
+          "strengths": []
+        }
+      }
+    ]
+  },
+  {
+    "id": "E006",
+    "name": "Dev Krishnan",
+    "status": "AVAILABLE",
+    "available_since": "2026-06-10",
+    "location": "Chennai",
+    "skills": [
+      {
+        "id": "SK_REACT",
+        "name": "React",
+        "prof": 3
+      },
+      {
+        "id": "SK_TS",
+        "name": "TypeScript",
+        "prof": 3
+      },
+      {
+        "id": "SK_GQL",
+        "name": "GraphQL",
+        "prof": 4
+      }
+    ],
+    "softblock_job": null,
+    "softblock_manager": null,
+    "softblock_start": null,
+    "softblock_expiry": null,
+    "interviews": []
+  }
+]

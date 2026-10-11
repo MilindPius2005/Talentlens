@@ -1,0 +1,7 @@
+Flask==3.1.1
+gunicorn==23.0.0
+neo4j==5.28.4
+pymongo==4.13.2
+pandas>=2.0.0
+openpyxl>=3.1.0
+python-dotenv>=1.0.0

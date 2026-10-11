@@ -1,0 +1,175 @@
+[
+  {
+    "id": "A001",
+    "type": "BENCH",
+    "employee": "Priya Sharma",
+    "threshold": 30,
+    "sent_at": "2026-06-04",
+    "bench_age": 30,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "A002",
+    "type": "BENCH",
+    "employee": "Aisha Patel",
+    "threshold": 45,
+    "sent_at": "2026-05-25",
+    "bench_age": 45,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "A003",
+    "type": "BENCH",
+    "employee": "Meera Nair",
+    "threshold": 45,
+    "sent_at": "2026-06-29",
+    "bench_age": 45,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-b0f446a7",
+    "type": "BENCH",
+    "employee": "Priya Sharma",
+    "threshold": 45,
+    "sent_at": "2026-08-28",
+    "bench_age": 115,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-c9f20ec6",
+    "type": "BENCH",
+    "employee": "Arjun Mehta",
+    "threshold": 30,
+    "sent_at": "2026-08-28",
+    "bench_age": 100,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-2d7698ee",
+    "type": "BENCH",
+    "employee": "Arjun Mehta",
+    "threshold": 45,
+    "sent_at": "2026-08-28",
+    "bench_age": 100,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-97b322e4",
+    "type": "BENCH",
+    "employee": "Meera Nair",
+    "threshold": 30,
+    "sent_at": "2026-08-28",
+    "bench_age": 105,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-e42e229d",
+    "type": "BENCH",
+    "employee": "Ravi Kumar",
+    "threshold": 30,
+    "sent_at": "2026-08-28",
+    "bench_age": 88,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-e6865a2e",
+    "type": "BENCH",
+    "employee": "Ravi Kumar",
+    "threshold": 45,
+    "sent_at": "2026-08-28",
+    "bench_age": 88,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-0d0e77eb",
+    "type": "BENCH",
+    "employee": "Aisha Patel",
+    "threshold": 30,
+    "sent_at": "2026-08-28",
+    "bench_age": 140,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-91137f57",
+    "type": "BENCH",
+    "employee": "Dev Krishnan",
+    "threshold": 30,
+    "sent_at": "2026-08-28",
+    "bench_age": 79,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "BA-f4d9bbf0",
+    "type": "BENCH",
+    "employee": "Dev Krishnan",
+    "threshold": 45,
+    "sent_at": "2026-08-28",
+    "bench_age": 79,
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "SB-e638be4a",
+    "type": "SOFTBLOCK",
+    "employee": "Ravi Kumar",
+    "employee_id": "E004",
+    "job_id": "J001",
+    "job_description": "Senior Frontend Developer @ Acme Corp",
+    "softblocked_by": "Test Manager",
+    "sent_at": "2026-08-28",
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "REL-bf8b4da8",
+    "type": "RELEASE",
+    "employee": "Aisha Patel",
+    "employee_id": "E005",
+    "job_description": "ML Engineer @ DataVision",
+    "sent_at": "2026-08-28",
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "REL-7efe1953",
+    "type": "RELEASE",
+    "employee": "Aisha Patel",
+    "employee_id": "E005",
+    "job_description": null,
+    "sent_at": "2026-08-28",
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "REL-4973f2cb",
+    "type": "RELEASE",
+    "employee": "Aisha Patel",
+    "employee_id": "E005",
+    "job_description": null,
+    "sent_at": "2026-08-28",
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "REL-1ae34091",
+    "type": "RELEASE",
+    "employee": "Aisha Patel",
+    "employee_id": "E005",
+    "job_description": null,
+    "sent_at": "2026-08-28",
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "REL-eaa7593d",
+    "type": "RELEASE",
+    "employee": "Aisha Patel",
+    "employee_id": "E005",
+    "job_description": null,
+    "sent_at": "2026-08-28",
+    "recipient": "hr@company.com"
+  },
+  {
+    "id": "REL-4a9117dc",
+    "type": "RELEASE",
+    "employee": "Aisha Patel",
+    "employee_id": "E005",
+    "job_description": null,
+    "sent_at": "2026-08-28",
+    "recipient": "hr@company.com"
+  }
+]

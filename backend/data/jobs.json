@@ -1,0 +1,67 @@
+[
+  {
+    "id": "J001",
+    "role": "Senior Frontend Developer",
+    "client": "Acme Corp",
+    "status": "OPEN",
+    "open_date": "2026-06-20",
+    "location": "Bangalore",
+    "description": "Looking for a senior frontend developer with strong React and TypeScript experience to lead our UI team.",
+    "required_skills": [
+      {
+        "name": "React",
+        "min_proficiency": 4
+      },
+      {
+        "name": "TypeScript",
+        "min_proficiency": 3
+      },
+      {
+        "name": "Node.js",
+        "min_proficiency": 3
+      }
+    ]
+  },
+  {
+    "id": "J002",
+    "role": "ML Engineer",
+    "client": "DataVision",
+    "status": "OPEN",
+    "open_date": "2026-06-25",
+    "location": "Remote",
+    "description": "ML engineer to build and deploy production ML pipelines on AWS.",
+    "required_skills": [
+      {
+        "name": "Python",
+        "min_proficiency": 4
+      },
+      {
+        "name": "ML",
+        "min_proficiency": 4
+      },
+      {
+        "name": "AWS",
+        "min_proficiency": 3
+      }
+    ]
+  },
+  {
+    "id": "J003",
+    "role": "Backend Java Engineer",
+    "client": "FinServ Ltd",
+    "status": "CLOSED",
+    "open_date": "2026-06-01",
+    "location": "Mumbai",
+    "description": "Java Spring Boot backend engineer for fintech platform.",
+    "required_skills": [
+      {
+        "name": "Java",
+        "min_proficiency": 4
+      },
+      {
+        "name": "Spring Boot",
+        "min_proficiency": 3
+      }
+    ]
+  }
+]

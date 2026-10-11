@@ -1,0 +1,9 @@
+[
+  {
+    "id": "5c3ddea9cda341658d0d47207aae58f8",
+    "name": "milindpius",
+    "email": "milind@gmail.com",
+    "role": "Explorer",
+    "passwordHash": "pbkdf2:sha256:1000000$HgKyKRwfDlYRihNX$61180451f783326f4be1ff1023838fafbf3ccab59e411abb3682bde46ed3d033"
+  }
+]
