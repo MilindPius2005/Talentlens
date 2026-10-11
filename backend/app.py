@@ -306,6 +306,7 @@ def get_employees():
                         'location': emp.get('location'),
                         'skills': emp.get('skills', []),
                         'softblock_job': emp.get('softblock_job'),
+                        'softblock_company': emp.get('softblock_company'),
                         'softblock_manager': emp.get('softblock_manager'),
                         'softblock_start': emp.get('softblock_start'),
                         'softblock_expiry': emp.get('softblock_expiry'),
@@ -331,7 +332,8 @@ def get_employees():
                 if location and location not in rec.get('location', []): continue
                 if domain and domain not in rec.get('domain', []): continue
                 if level and level not in rec.get('level', []): continue
-                if status and status.upper() != 'AVAILABLE': continue
+                rec_status = rec.get('status', 'AVAILABLE')
+                if status and status.upper() != rec_status: continue
                 if search and search.lower() not in emp_name.lower(): continue
                 if skill_filter and not any(sk in all_skills for sk in skill_filter): continue
 
@@ -349,15 +351,16 @@ def get_employees():
                 employees.append({
                     'id': emp_name,
                     'name': emp_name,
-                    'status': 'AVAILABLE',
+                    'status': rec_status,
                     'available_since': avail_date_str,
                     'bench_aging': bench_days,
                     'location': rec.get('location', [None])[0] if rec.get('location') else None,
                     'skills': all_skills,
-                    'softblock_job': None,
-                    'softblock_manager': None,
-                    'softblock_start': None,
-                    'softblock_expiry': None,
+                    'softblock_job': rec.get('softblock_job'),
+                    'softblock_company': rec.get('softblock_company'),
+                    'softblock_manager': rec.get('softblock_manager'),
+                    'softblock_start': rec.get('softblock_start'),
+                    'softblock_expiry': rec.get('softblock_expiry'),
                     'interviews': [],
                     'neo4j_pending': True
                 })
@@ -373,32 +376,42 @@ def softblock_employee(emp_id):
     if not user: return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
     
-    job_label = data.get('job_label') or data.get('job_id') or 'Opportunity'
+    job_label = (data.get('job_position') or data.get('job_label') or '').strip()
+    company_name = (data.get('company_name') or '').strip()
+    if not job_label or not company_name:
+        return jsonify({"error": "Company name and job position are required"}), 400
     manager_name = data.get('manager_name') or user.get('name') or 'Admin'
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     expiry = (datetime.now(timezone.utc) + timedelta(days=SOFTBLOCK_DAYS)).strftime('%Y-%m-%d')
     
     emp_name = emp_id
+    graph_updated = False
     try:
         with get_neo4j_driver() as driver:
             with driver.session(database=NEO4J_DATABASE) as session:
                 res = session.run(
-                    "MATCH (e:Employee) WHERE e.name = $emp_id OR e.id = $emp_id SET e.status = 'SOFTBLOCKED', e.softblock_job = $job, e.softblock_manager = $manager, e.softblock_start = $start, e.softblock_expiry = $expiry RETURN e.name AS name",
-                    emp_id=emp_id, job=job_label, manager=manager_name, start=today, expiry=expiry
+                    "MATCH (e:Employee) WHERE e.name = $emp_id OR e.id = $emp_id SET e.status = 'SOFTBLOCKED', e.softblock_job = $job, e.softblock_company = $company, e.softblock_manager = $manager, e.softblock_start = $start, e.softblock_expiry = $expiry RETURN e.name AS name",
+                    emp_id=emp_id, job=job_label, company=company_name, manager=manager_name, start=today, expiry=expiry
                 )
                 rec = res.single()
                 if rec and rec['name']:
                     emp_name = rec['name']
+                    graph_updated = True
     except Exception as e:
         print(f"Neo4j softblock error: {e}")
 
+    queue_updated = False
     try:
-        mongo_db['pending_neo4j_queue'].update_many(
-            {"records.Emp_Name": emp_id},
-            {"$set": {"records.$.status": "SOFTBLOCKED", "records.$.softblock_job": job_label, "records.$.softblock_manager": manager_name, "records.$.softblock_start": today, "records.$.softblock_expiry": expiry}}
+        result = mongo_db['pending_neo4j_queue'].update_many(
+            {"records.emp_name": emp_name},
+            {"$set": {"records.$.status": "SOFTBLOCKED", "records.$.softblock_job": job_label, "records.$.softblock_company": company_name, "records.$.softblock_manager": manager_name, "records.$.softblock_start": today, "records.$.softblock_expiry": expiry}}
         )
+        queue_updated = result.matched_count > 0
     except Exception:
         pass
+
+    if not graph_updated and not queue_updated:
+        return jsonify({"error": "Employee was not found in the available database. No soft-block was saved."}), 503
 
     alert_doc = {
         'id': f"SB-{uuid.uuid4().hex[:8]}",
@@ -406,22 +419,31 @@ def softblock_employee(emp_id):
         'employee': emp_name,
         'employee_id': emp_id,
         'job_description': job_label,
+        'company_name': company_name,
         'softblocked_by': manager_name,
         'expiry_date': expiry,
-        'sent_at': today,
+        'sent_at': datetime.now(timezone.utc).isoformat(),
         'recipient': 'hr@company.com'
     }
     mongo_db['alerts'].insert_one(alert_doc)
-    return jsonify({"ok": True, "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
+    return jsonify({"ok": True, "status": "SOFTBLOCKED", "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
 
 @app.route('/employees/<emp_id>/release', methods=['POST', 'OPTIONS'])
 def release_employee(emp_id):
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
     if not user: return jsonify({"error": "Unauthorized"}), 401
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today = datetime.now(timezone.utc).isoformat()
     emp_name = emp_id
     released_from = 'Previous Opportunity'
+    try:
+        queued = mongo_db['pending_neo4j_queue'].find_one(
+            {'records.emp_name': emp_id}, {'records.$': 1})
+        if queued and queued.get('records'):
+            released_from = queued['records'][0].get('softblock_job') or released_from
+    except Exception:
+        pass
+    graph_updated = False
     try:
         with get_neo4j_driver() as driver:
             with driver.session(database=NEO4J_DATABASE) as session:
@@ -430,17 +452,23 @@ def release_employee(emp_id):
                 if rec:
                     if rec.get('name'): emp_name = rec['name']
                     if rec.get('job'): released_from = rec['job']
-                session.run("MATCH (e:Employee) WHERE e.name = $emp_id OR e.id = $emp_id SET e.status = 'AVAILABLE', e.softblock_job = null, e.softblock_manager = null, e.softblock_start = null, e.softblock_expiry = null", emp_id=emp_id)
+                result = session.run("MATCH (e:Employee) WHERE e.name = $emp_id OR e.id = $emp_id SET e.status = 'AVAILABLE', e.softblock_job = null, e.softblock_company = null, e.softblock_manager = null, e.softblock_start = null, e.softblock_expiry = null RETURN e.name AS name", emp_id=emp_id)
+                graph_updated = result.single() is not None
     except Exception as e:
         print(f"Neo4j release error: {e}")
 
+    queue_updated = False
     try:
-        mongo_db['pending_neo4j_queue'].update_many(
-            {"records.Emp_Name": emp_id},
-            {"$set": {"records.$.status": "AVAILABLE", "records.$.softblock_job": None, "records.$.softblock_manager": None, "records.$.softblock_start": None, "records.$.softblock_expiry": None}}
+        result = mongo_db['pending_neo4j_queue'].update_many(
+            {"records.emp_name": emp_name},
+            {"$set": {"records.$.status": "AVAILABLE", "records.$.softblock_job": None, "records.$.softblock_company": None, "records.$.softblock_manager": None, "records.$.softblock_start": None, "records.$.softblock_expiry": None}}
         )
+        queue_updated = result.matched_count > 0
     except Exception:
         pass
+
+    if not graph_updated and not queue_updated:
+        return jsonify({"error": "Employee was not found in the available database. No release was saved."}), 503
 
     alert_doc = {
         'id': f"REL-{uuid.uuid4().hex[:8]}",
@@ -452,7 +480,7 @@ def release_employee(emp_id):
         'recipient': 'hr@company.com'
     }
     mongo_db['alerts'].insert_one(alert_doc)
-    return jsonify({"ok": True, "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
+    return jsonify({"ok": True, "status": "AVAILABLE", "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
 
 @app.route('/employees/<emp_id>/snooze', methods=['POST', 'OPTIONS'])
 def snooze_employee(emp_id):
@@ -460,11 +488,33 @@ def snooze_employee(emp_id):
     user = get_current_user()
     if not user: return jsonify({"error": "Unauthorized"}), 401
     expiry = (datetime.now(timezone.utc) + timedelta(days=SOFTBLOCK_DAYS)).strftime('%Y-%m-%d')
+    graph_updated = False
     try:
         with get_neo4j_driver() as driver:
             with driver.session(database=NEO4J_DATABASE) as session:
-                session.run("MATCH (e:Employee) WHERE e.name = $emp_id OR e.id = $emp_id SET e.softblock_expiry = $expiry", emp_id=emp_id, expiry=expiry)
-    except Exception as e: return jsonify({"error": str(e)}), 500
+                result = session.run("MATCH (e:Employee) WHERE (e.name = $emp_id OR e.id = $emp_id) AND e.status = 'SOFTBLOCKED' SET e.softblock_expiry = $expiry RETURN e.name AS name", emp_id=emp_id, expiry=expiry)
+                graph_updated = result.single() is not None
+    except Exception as e:
+        print(f"Neo4j snooze error: {e}")
+    queue_updated = False
+    try:
+        result = mongo_db['pending_neo4j_queue'].update_many(
+            {"records": {"$elemMatch": {"emp_name": emp_id, "status": "SOFTBLOCKED"}}},
+            {"$set": {"records.$.softblock_expiry": expiry}}
+        )
+        queue_updated = result.matched_count > 0
+    except Exception as e:
+        print(f"Queue snooze error: {e}")
+    if not graph_updated and not queue_updated:
+        return jsonify({"error": "Soft-blocked employee was not found. No reminder was snoozed."}), 404
+    alert_doc = {
+        'id': f"SNZ-{uuid.uuid4().hex[:8]}", 'type': 'SNOOZE',
+        'employee': emp_id, 'employee_id': emp_id, 'expiry_date': expiry,
+        'sent_at': datetime.now(timezone.utc).isoformat(),
+        'recipient': 'hr@company.com'
+    }
+    mongo_db['alerts'].insert_one(alert_doc)
+    return jsonify({"ok": True, "expiry_date": expiry, "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
 
 @app.route('/jobs', methods=['POST', 'OPTIONS'])
 def add_job():
@@ -479,6 +529,14 @@ def add_job():
     location = data.get('location', '')
     status = data.get('status', 'OPEN')
     description = data.get('description', '')
+    def log_job_creation(pending=False):
+        mongo_db['alerts'].insert_one({
+            'id': f"JOB-{uuid.uuid4().hex[:8]}", 'type': 'JOB_CREATED',
+            'employee': role or 'New position', 'job_description': role,
+            'company_name': client, 'neo4j_pending': pending,
+            'sent_at': datetime.now(timezone.utc).isoformat(),
+            'recipient': 'hr@company.com'
+        })
     
     try:
         with get_neo4j_driver() as driver:
@@ -503,6 +561,7 @@ def add_job():
                 # unless they want jobs to show up in skill filters.
                 # Just store them as properties or relationships.
                 
+        log_job_creation()
         return jsonify({"status": "success"})
     except Exception as e:
         print(f"Error adding job to Neo4j: {e}")
@@ -515,6 +574,7 @@ def add_job():
                     'location': location
                 }]
             })
+        log_job_creation(pending=True)
         return jsonify({"status": "success", "neo4j_pending": True})
 
 @app.route('/alerts', methods=['GET'])
@@ -528,7 +588,7 @@ def get_alerts():
         with get_neo4j_driver() as driver:
             with driver.session(database=NEO4J_DATABASE) as session:
                 # 1. Bench aging alerts
-                res = session.run("MATCH (e:Employee) WHERE e.status <> 'MAPPED' AND e.available_since IS NOT NULL RETURN e.id AS id, e.name AS name, e.available_since AS avail")
+                res = session.run("MATCH (e:Employee) WHERE e.status = 'AVAILABLE' AND e.available_since IS NOT NULL RETURN e.id AS id, e.name AS name, e.available_since AS avail")
                 for r in res:
                     try:
                         a_date = datetime.strptime(r['avail'], '%Y-%m-%d').replace(tzinfo=timezone.utc)
@@ -538,7 +598,7 @@ def get_alerts():
                     except: pass
 
                 # 2. All SOFTBLOCKED employees in graph
-                res = session.run("MATCH (e:Employee) WHERE e.status = 'SOFTBLOCKED' RETURN e.id AS id, e.name AS name, e.softblock_expiry AS exp, e.softblock_job AS job, e.softblock_manager AS manager, e.softblock_start AS start")
+                res = session.run("MATCH (e:Employee) WHERE e.status = 'SOFTBLOCKED' RETURN e.id AS id, e.name AS name, e.softblock_expiry AS exp, e.softblock_job AS job, e.softblock_company AS company, e.softblock_manager AS manager, e.softblock_start AS start")
                 for r in res:
                     try:
                         exp_str = r.get('exp')
@@ -554,6 +614,7 @@ def get_alerts():
                                 'employee': r['name'],
                                 'employee_id': r.get('id') or r['name'],
                                 'job_description': r.get('job') or 'Opportunity',
+                                'company_name': r.get('company'),
                                 'softblocked_by': r.get('manager') or 'Manager',
                                 'expiry_date': exp_str,
                                 'sent_at': today_str,
@@ -566,6 +627,7 @@ def get_alerts():
                                 'employee': r['name'],
                                 'employee_id': r.get('id') or r['name'],
                                 'job_description': r.get('job') or 'Opportunity',
+                                'company_name': r.get('company'),
                                 'softblocked_by': r.get('manager') or 'Manager',
                                 'expiry_date': exp_str,
                                 'sent_at': r.get('start') or today_str,
@@ -574,21 +636,42 @@ def get_alerts():
                     except: pass
     except: pass
 
-    # Also fallback to pending queue for SOFTBLOCKED employees if neo4j was offline
+    # Include pending employees in automatic bench reminders and active soft-blocks.
     try:
+        pending_seen = set()
         for job in mongo_db['pending_neo4j_queue'].find({}, {'records': 1, 'today': 1}):
             for rec in job.get('records', []):
+                emp_name = rec.get('emp_name')
+                if not emp_name or emp_name.lower() in pending_seen:
+                    continue
+                pending_seen.add(emp_name.lower())
+                if rec.get('status', 'AVAILABLE') == 'AVAILABLE':
+                    try:
+                        available_since = rec.get('available_since') or job.get('today')
+                        bench_days = (today - datetime.strptime(available_since, '%Y-%m-%d').replace(tzinfo=timezone.utc)).days
+                        threshold = 45 if bench_days >= 45 else 30 if bench_days >= 30 else None
+                        if threshold and not any(a.get('type') == 'BENCH' and a.get('employee') == emp_name for a in alerts):
+                            alerts.append({
+                                'id': f"A{threshold}-{emp_name}", 'type': 'BENCH',
+                                'threshold': threshold, 'bench_age': bench_days,
+                                'employee': emp_name, 'employee_id': emp_name,
+                                'sent_at': today_str, 'recipient': 'hr@company.com'
+                            })
+                    except (TypeError, ValueError):
+                        pass
                 if rec.get('status') == 'SOFTBLOCKED':
-                    emp_name = rec.get('Emp_Name') or rec.get('name')
-                    if emp_name and not any(a.get('employee') == emp_name and a.get('type') == 'SOFTBLOCK' for a in alerts):
+                    if emp_name and not any(a.get('employee') == emp_name and a.get('type') in ('SOFTBLOCK', 'SOFTBLOCK_EXPIRY') for a in alerts):
+                        expiry_str = rec.get('softblock_expiry')
+                        expired = bool(expiry_str and expiry_str <= today_str)
                         alerts.append({
-                            'id': f"SB-{emp_name}",
-                            'type': 'SOFTBLOCK',
+                            'id': f"{'EXP' if expired else 'SB'}-{emp_name}",
+                            'type': 'SOFTBLOCK_EXPIRY' if expired else 'SOFTBLOCK',
                             'employee': emp_name,
                             'employee_id': emp_name,
                             'job_description': rec.get('softblock_job') or 'Opportunity',
+                            'company_name': rec.get('softblock_company'),
                             'softblocked_by': rec.get('softblock_manager') or 'Manager',
-                            'expiry_date': rec.get('softblock_expiry'),
+                            'expiry_date': expiry_str,
                             'sent_at': rec.get('softblock_start') or today_str,
                             'recipient': 'hr@company.com'
                         })
@@ -597,10 +680,17 @@ def get_alerts():
     # Persisted alerts from MongoDB
     mongo_alerts = list(mongo_db['alerts'].find({}, {'_id': 0}))
 
-    # Merge avoiding duplicate employee+type or id
+    # Keep every persisted change, including repeated soft-block/release cycles.
+    # A current-state soft-block entry is redundant when the matching event exists.
+    persisted_softblocks = {
+        (a.get('employee'), a.get('job_description'), a.get('sent_at', '')[:10])
+        for a in mongo_alerts if a.get('type') == 'SOFTBLOCK'
+    }
     merged = []
     seen = set()
     for a in alerts:
+        if a.get('type') == 'SOFTBLOCK' and (a.get('employee'), a.get('job_description'), a.get('sent_at', '')[:10]) in persisted_softblocks:
+            continue
         key = a.get('id') or f"{a.get('type')}-{a.get('employee')}"
         if key not in seen:
             merged.append(a)
@@ -608,11 +698,9 @@ def get_alerts():
 
     for ma in mongo_alerts:
         key = ma.get('id') or f"{ma.get('type')}-{ma.get('employee')}"
-        emp_key = f"{ma.get('type')}-{ma.get('employee')}"
-        if key not in seen and emp_key not in seen:
+        if key not in seen:
             merged.append(ma)
             seen.add(key)
-            seen.add(emp_key)
 
     return jsonify(merged)
 
@@ -703,23 +791,28 @@ def expand_node(node):
     user = get_current_user()
     if not user: return jsonify({"error": "Unauthorized"}), 401
     nodes, links = [], []
+    def graph_node(value):
+        labels = list(value.labels)
+        item = {'id': value.get('id', value.get('name')), 'label': value.get('name'), 'type': labels[0] if labels else 'Node'}
+        if 'Employee' in labels:
+            for field in ('status', 'available_since', 'softblock_job', 'softblock_company', 'softblock_manager', 'softblock_start', 'softblock_expiry'):
+                item[field] = value.get(field)
+        return item
     try:
         with get_neo4j_driver() as driver:
             with driver.session(database=NEO4J_DATABASE) as session:
                 root_res = session.run("MATCH (n {name: $node}) RETURN n", node=node)
                 root_rec = root_res.single()
                 if root_rec:
-                    rn = root_rec['n']
-                    rn_id = rn.get('id', rn.get('name'))
-                    nodes.append({'id': rn_id, 'label': rn.get('name'), 'type': list(rn.labels)[0] if rn.labels else 'Node'})
+                    nodes.append(graph_node(root_rec['n']))
 
                 res = session.run("MATCH (n {name: $node})-[r]-(m) RETURN n, r, m", node=node)
                 for rec in res:
                     n = rec['n']; m = rec['m']; r = rec['r']
                     n_id = n.get('id', n.get('name'))
                     m_id = m.get('id', m.get('name'))
-                    if not any(d['id'] == n_id for d in nodes): nodes.append({'id': n_id, 'label': n.get('name'), 'type': list(n.labels)[0] if n.labels else 'Node'})
-                    if not any(d['id'] == m_id for d in nodes): nodes.append({'id': m_id, 'label': m.get('name'), 'type': list(m.labels)[0] if m.labels else 'Node'})
+                    if not any(d['id'] == n_id for d in nodes): nodes.append(graph_node(n))
+                    if not any(d['id'] == m_id for d in nodes): nodes.append(graph_node(m))
                     links.append({'source': n_id if r.nodes[0] == n else m_id, 'target': m_id if r.nodes[0] == n else n_id, 'type': r.type})
     except Exception as e:
         print(f"Expand Neo4j error: {e}")
@@ -728,9 +821,14 @@ def expand_node(node):
     if not nodes:
         try:
             node_lower = node.lower()
-            def add_n(n_id, n_type):
+            def add_n(n_id, n_type, rec=None):
                 if not any(n['id'] == n_id for n in nodes):
-                    nodes.append({'id': n_id, 'label': n_id, 'type': n_type})
+                    item = {'id': n_id, 'label': n_id, 'type': n_type}
+                    if n_type == 'Employee' and rec:
+                        for field in ('status', 'available_since', 'softblock_job', 'softblock_company', 'softblock_manager', 'softblock_start', 'softblock_expiry'):
+                            item[field] = rec.get(field)
+                        item['status'] = item['status'] or 'AVAILABLE'
+                    nodes.append(item)
             def add_l(src, tgt, rel):
                 if not any((l['source'] == src and l['target'] == tgt and l['type'] == rel) for l in links):
                     links.append({'source': src, 'target': tgt, 'type': rel})
@@ -746,7 +844,7 @@ def expand_node(node):
                     levels = rec.get('level', [])
                     
                     if emp_name and emp_name.lower() == node_lower:
-                        add_n(emp_name, 'Employee')
+                        add_n(emp_name, 'Employee', rec)
                         if client_name and client_name not in ('nan', '', 'None'):
                             add_n(client_name, 'Client')
                             add_l(emp_name, client_name, 'WORKED_FOR')
@@ -763,37 +861,37 @@ def expand_node(node):
                     
                     elif client_name and client_name.lower() == node_lower:
                         add_n(client_name, 'Client')
-                        add_n(emp_name, 'Employee')
+                        add_n(emp_name, 'Employee', rec)
                         add_l(emp_name, client_name, 'WORKED_FOR')
                         
                     elif any(s and s.lower() == node_lower for s in skills):
                         matched = next(s for s in skills if s.lower() == node_lower)
                         add_n(matched, 'Skill')
-                        add_n(emp_name, 'Employee')
+                        add_n(emp_name, 'Employee', rec)
                         add_l(emp_name, matched, 'HAS_SKILL')
                         
                     elif any(s and s.lower() == node_lower for s in misc_skills):
                         matched = next(s for s in misc_skills if s.lower() == node_lower)
                         add_n(matched, 'Skill')
-                        add_n(emp_name, 'Employee')
+                        add_n(emp_name, 'Employee', rec)
                         add_l(emp_name, matched, 'HAS_MISC_SKILL')
                         
                     elif any(d and d.lower() == node_lower for d in domains):
                         matched = next(d for d in domains if d.lower() == node_lower)
                         add_n(matched, 'Domain')
-                        add_n(emp_name, 'Employee')
+                        add_n(emp_name, 'Employee', rec)
                         add_l(emp_name, matched, 'HAS_DOMAIN')
                         
                     elif any(l and l.lower() == node_lower for l in locations):
                         matched = next(l for l in locations if l.lower() == node_lower)
                         add_n(matched, 'Location')
-                        add_n(emp_name, 'Employee')
+                        add_n(emp_name, 'Employee', rec)
                         add_l(emp_name, matched, 'HAS_LOCATION')
                         
                     elif any(l and l.lower() == node_lower for l in levels):
                         matched = next(l for l in levels if l.lower() == node_lower)
                         add_n(matched, 'Level')
-                        add_n(emp_name, 'Employee')
+                        add_n(emp_name, 'Employee', rec)
                         add_l(emp_name, matched, 'HAS_LEVEL')
         except Exception as e:
             print(f"Pending queue expand error: {e}")
@@ -901,6 +999,13 @@ def upload_file():
         'timestamp': datetime.now(timezone.utc).isoformat(), 'rows_processed': len(records),
         'neo4j_synced': neo4j_synced
     })
+    mongo_db['alerts'].insert_one({
+        'id': f"ING-{uuid.uuid4().hex[:8]}", 'type': 'INGESTION',
+        'employee': f"{len(records)} employees", 'filename': file.filename,
+        'rows_processed': len(records), 'neo4j_pending': not neo4j_synced,
+        'sent_at': datetime.now(timezone.utc).isoformat(),
+        'recipient': 'hr@company.com'
+    })
 
     if neo4j_synced:
         return jsonify({"status": "success", "message": f"File ingested successfully. {len(records)} records added to knowledge graph."})
@@ -948,7 +1053,7 @@ def sync_pending_neo4j():
                     records = job['records']
                     owner = job['owner']
                     with driver.session(database=NEO4J_DATABASE) as session:
-                        session.run("UNWIND $records AS rec MERGE (e:Employee {name: rec.emp_name}) ON CREATE SET e.owner = $owner, e.status = 'AVAILABLE', e.available_since = rec.available_since ON MATCH SET e.owner = $owner, e.available_since = rec.available_since", records=records, owner=owner)
+                        session.run("UNWIND $records AS rec MERGE (e:Employee {name: rec.emp_name}) ON CREATE SET e.owner = $owner, e.status = 'AVAILABLE', e.available_since = rec.available_since ON MATCH SET e.owner = $owner, e.available_since = rec.available_since SET e.status = coalesce(rec.status, e.status, 'AVAILABLE'), e.softblock_job = rec.softblock_job, e.softblock_company = rec.softblock_company, e.softblock_manager = rec.softblock_manager, e.softblock_start = rec.softblock_start, e.softblock_expiry = rec.softblock_expiry", records=records, owner=owner)
                         session.run("UNWIND $records AS rec WITH rec WHERE rec.client_name IS NOT NULL AND rec.client_name <> '' AND rec.client_name <> 'nan' MATCH (e:Employee {name: rec.emp_name}) MERGE (c:Client {name: rec.client_name}) ON CREATE SET c.owner = $owner MERGE (e)-[:WORKED_FOR]->(c)", records=records, owner=owner)
                         session.run("UNWIND $records AS rec UNWIND rec.skills AS skill WITH rec, skill WHERE skill <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (s:Skill {name: skill}) ON CREATE SET s.owner = $owner MERGE (e)-[:HAS_SKILL]->(s)", records=records, owner=owner)
                         session.run("UNWIND $records AS rec UNWIND rec.misc_skills AS skill WITH rec, skill WHERE skill <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (s:Skill {name: skill}) ON CREATE SET s.owner = $owner MERGE (e)-[:HAS_MISC_SKILL]->(s)", records=records, owner=owner)

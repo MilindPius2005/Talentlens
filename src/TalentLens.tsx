@@ -1,3 +1,4 @@
+// @ts-nocheck — This legacy component uses dynamic JavaScript data shapes.
 import { useState, useEffect, useRef } from "react";
 import * as d3 from "d3";
 import DatasetFilters from './DatasetFilters';
@@ -36,7 +37,6 @@ const css = `
   .graph-link { stroke: rgba(0,0,0,0.15); stroke-width: 1.4; }
   .graph-node { stroke: rgba(0,0,0,0.2); stroke-width: 1.4; filter: drop-shadow(0 4px 10px rgba(0,0,0,0.1)); cursor: pointer; transition: r 180ms ease, stroke-width 180ms ease, opacity 180ms ease; }
   .graph-node:hover { stroke-width: 3; }
-  .graph-node.selected { stroke: #000000; stroke-width: 4; }
   .graph-node.root { stroke: #0f172a; }
   .graph-node.expanded { filter: drop-shadow(0 0 6px rgba(10,124,136,0.35)); }
   .graph-label { pointer-events: auto; cursor: pointer; fill: #1E2233; paint-order: stroke; stroke: #ffffff; stroke-width: 4px; stroke-linejoin: round; font-size: 11px; font-weight: 600; }
@@ -227,8 +227,6 @@ function AgingBar({ days }) {
 function Dashboard({ employees, jobs, alerts, user, onLogout }) {
   const available = employees.filter(e => e.status === "AVAILABLE");
   const softblocked = employees.filter(e => e.status === "SOFTBLOCKED");
-  const totalBenchDays = available.reduce((s,e) => s + daysSince(e.available_since), 0);
-
   const critical = available.filter(e => daysSince(e.available_since) >= 45);
   const openJobs = jobs.filter(j => j.status === "OPEN");
   return (
@@ -249,24 +247,9 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
         <div className="stat-card"><div className="stat-value" style={{ color: T.teal }}>{available.length}</div><div className="stat-label">Available on bench</div></div>
         <div className="stat-card"><div className="stat-value" style={{ color: T.amber }}>{critical.length}</div><div className="stat-label">Critical (45+ days)</div>{critical.length > 0 && <div className="stat-delta delta-down">↑ Needs attention</div>}</div>
         <div className="stat-card"><div className="stat-value" style={{ color: T.green }}>{openJobs.length}</div><div className="stat-label">Open jobs</div></div>
-        <div className="stat-card"><div className="stat-value" style={{ color: T.violet }}>{employees.reduce((s,e) => s + e.interviews.length, 0)}</div><div className="stat-label">Interviews logged</div></div>
+        <div className="stat-card"><div className="stat-value" style={{ color: T.amber }}>{softblocked.length}</div><div className="stat-label">Soft-blocked employees</div></div>
       </div>
-      <div className="grid3" style={{ marginBottom: 20 }}>
-        <div className="card">
-          <div className="card-title">Bench aging snapshot</div>
-          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-            {available.map(e => {
-              const days = daysSince(e.available_since);
-              return (
-                <div key={e.id} style={{ display:"flex", alignItems:"center", gap:10 }}>
-                  <div style={{ width:110, fontSize:13, fontWeight:500, flexShrink:0 }}>{e.name.split(" ")[0]}</div>
-                  <AgingBar days={days} />
-                  {days >= 45 && <span style={{ fontSize:11, color:T.red, fontWeight:700 }}>ALERT</span>}
-                </div>
-              );
-            })}
-          </div>
-        </div>
+      <div className="grid2" style={{ marginBottom: 20 }}>
         <div className="card">
           <div className="card-title">Recent HR alerts</div>
           {alerts.slice(-4).reverse().map(a => (
@@ -280,7 +263,7 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
                 <div style={{ fontSize:13, fontWeight:600 }}>{a.employee}</div>
                 <div style={{ fontSize:12, color:T.muted, marginTop:2 }}>
                   {a.type === "SOFTBLOCK"
-                    ? <>Soft-blocked for {a.job_description} · by {a.softblocked_by} · {a.sent_at}</>
+                    ? <>Soft-blocked for {a.job_description}{a.company_name ? ` @ ${a.company_name}` : ''} · by {a.softblocked_by} · {a.sent_at}</>
                     : a.type === "RELEASE"
                     ? <>Released{a.job_description ? <> from {a.job_description}</> : ""} · {a.sent_at}</>
                     : a.type === "SOFTBLOCK_EXPIRY"
@@ -290,7 +273,7 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
               </div>
             </div>
           ))}
-        
+        </div>
         <div className="card">
           <div className="card-title">Soft-blocked personnel</div>
           <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
@@ -301,7 +284,7 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
                   <span style={{ fontSize:13, fontWeight:600 }}>{e.name}</span>
                   <span style={{ fontSize:11, color:T.amber }}>{e.softblock_expiry ? "Expires " + e.softblock_expiry : ""}</span>
                 </div>
-                <div style={{ fontSize:12, color:T.muted }}>{e.softblock_job || "Opportunity"}</div>
+                <div style={{ fontSize:12, color:T.muted }}>{[e.softblock_job, e.softblock_company].filter(Boolean).join(' @ ') || "Opportunity"}</div>
                 <div style={{ fontSize:11, color:T.muted }}>By {e.softblock_manager || "Manager"}</div>
               </div>
             ))}
@@ -313,7 +296,12 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
         <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
           {(() => {
             const skillMap = {};
-            employees.forEach(e => e.skills.forEach(s => { if (!skillMap[s.name]) skillMap[s.name] = 0; if (e.status === "AVAILABLE") skillMap[s.name]++; }));
+            employees.forEach(e => (e.skills || []).forEach(s => {
+              const skillName = typeof s === "string" ? s : s?.name;
+              if (!skillName) return;
+              if (!skillMap[skillName]) skillMap[skillName] = 0;
+              if (e.status === "AVAILABLE") skillMap[skillName]++;
+            }));
             return Object.entries(skillMap).sort((a,b)=>b[1]-a[1]).map(([skill,count]) => (
               <div key={skill} style={{ padding:"6px 12px", background:T.bg, border:`1px solid ${T.line}`, borderRadius:8, fontSize:12, display:"flex", alignItems:"center", gap:6 }}>
                 <span style={{ fontWeight:600 }}>{skill}</span>
@@ -328,14 +316,14 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
 }
 
 // ─── Employees ────────────────────────────────────────────────────────────────
-function Employees({ employees, setEmployees, user, setAlerts }) {
+function Employees({ employees, setEmployees, user, setAlerts, pendingRequests = [] }) {
   const [showAdd, setShowAdd] = useState(false);
   const [selected, setSelected] = useState(null);
   const [form, setForm] = useState({ name:"", status:"AVAILABLE", available_since:"", skills:"" });
 
   function addEmployee() {
     const e = {
-      id: "E" + String(Date.now()).slice(-4), name: form.name, status: form.status,
+      id: "E" + String(Date.now()).slice(-4), name: form.name, status: form.status, local_only: true,
       available_since: form.available_since, last_alerted: 0, interviews: [],
       skills: form.skills.split(",").map(s => { const [name, proficiency] = s.trim().split(":"); return { name: name?.trim(), proficiency: parseInt(proficiency) || 3 }; }).filter(s => s.name),
     };
@@ -398,7 +386,7 @@ function Employees({ employees, setEmployees, user, setAlerts }) {
 function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
   const [actionLoading, setActionLoading] = useState(false);
   const [showSoftblockForm, setShowSoftblockForm] = useState(false);
-  const [sbForm, setSbForm] = useState({ job_id: "J001", manager_name: "" });
+  const [sbForm, setSbForm] = useState({ company_name: "", job_position: "" });
   
   const days = daysSince(emp.available_since);
 
@@ -417,7 +405,8 @@ function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
           onUpdate({
             ...emp,
             status: action === "softblock" ? "SOFTBLOCKED" : "AVAILABLE",
-            softblock_job: action === "softblock" ? (payload.job_label || payload.job_id || "Opportunity") : null,
+            softblock_job: action === "softblock" ? payload.job_position : null,
+            softblock_company: action === "softblock" ? payload.company_name : null,
             softblock_manager: action === "softblock" ? (payload.manager_name || user?.name || "Admin") : null,
             softblock_start: action === "softblock" ? todayStr : null,
             softblock_expiry: action === "softblock" ? new Date(Date.now() + 15 * 86400000).toISOString().split("T")[0] : null
@@ -429,13 +418,14 @@ function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
                 type: "SOFTBLOCK",
                 employee: emp.name,
                 employee_id: emp.id,
-                job_description: payload.job_label || payload.job_id || "Opportunity",
+                job_description: payload.job_position,
+                company_name: payload.company_name,
                 softblocked_by: payload.manager_name || user?.name || "Admin",
                 expiry_date: new Date(Date.now() + 15 * 86400000).toISOString().split("T")[0],
                 sent_at: todayStr,
                 recipient: "hr@company.com"
               };
-              setAlerts(prev => [newAlert, ...prev.filter(a => !(a.employee === emp.name && a.type === "RELEASE"))]);
+              setAlerts(prev => [newAlert, ...prev]);
             } else if (action === "release") {
               const newAlert = resData?.alert || {
                 id: "REL" + String(Date.now()).slice(-6),
@@ -446,7 +436,7 @@ function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
                 sent_at: todayStr,
                 recipient: "hr@company.com"
               };
-              setAlerts(prev => [newAlert, ...prev.filter(a => !(a.employee === emp.name && a.type === "SOFTBLOCK"))]);
+              setAlerts(prev => [newAlert, ...prev]);
             }
           }
 
@@ -501,11 +491,11 @@ function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
           <div style={{ padding: 12, background: T.amberL, borderRadius: 8, marginBottom: 16 }}>
             <div style={{ fontWeight: 600, color: T.amber, marginBottom: 8 }}>Soft-block Details</div>
             <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-              <input type="text" className="form-input" placeholder="Job ID (e.g., J001)" value={sbForm.job_id} onChange={e => setSbForm(prev => ({...prev, job_id: e.target.value}))} />
-              <input type="text" className="form-input" placeholder="Manager Name" value={sbForm.manager_name} onChange={e => setSbForm(prev => ({...prev, manager_name: e.target.value}))} />
+              <input type="text" className="form-input" placeholder="Company Name" value={sbForm.company_name} onChange={e => setSbForm(prev => ({...prev, company_name: e.target.value}))} />
+              <input type="text" className="form-input" placeholder="Job Position" value={sbForm.job_position} onChange={e => setSbForm(prev => ({...prev, job_position: e.target.value}))} />
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <button className="btn btn-primary btn-sm" onClick={() => executeAction("softblock", sbForm)} disabled={actionLoading}>{actionLoading ? "..." : "Submit"}</button>
+              <button className="btn btn-primary btn-sm" onClick={() => executeAction("softblock", sbForm)} disabled={actionLoading || !sbForm.company_name.trim() || !sbForm.job_position.trim()}>{actionLoading ? "..." : "Submit"}</button>
               <button className="btn btn-ghost btn-sm" onClick={() => setShowSoftblockForm(false)}>Cancel</button>
             </div>
           </div>
@@ -677,7 +667,7 @@ function Interviews({ employees, setEmployees }) {
         )}
       </div>
       {showAdd && (
-        <div className="modal-overlay" onClick={() => { setShowAdd(false); setExtracted(null); }}>
+        <div className="modal-overlay" onClick={() => setShowAdd(false)}>
           <div className="modal" style={{ maxWidth:560 }} onClick={e => e.stopPropagation()}>
             <div className="modal-title">Log interview</div>
             <div className="grid2">
@@ -705,43 +695,22 @@ function Interviews({ employees, setEmployees }) {
 }
 
 // ─── Alerts ───────────────────────────────────────────────────────────────────
-function Alerts({ employees, alerts, setAlerts, onUnblock, onSnooze, onClearAlerts }) {
-  const [generated, setGenerated] = useState(false);
-  function checkAndGenerateAlerts() {
-    const today = new Date().toISOString().split("T")[0];
-    const newAlerts = [];
-    employees.forEach(e => {
-      if (e.status === "MAPPED") return;
-      const days = daysSince(e.available_since);
-      const thresholds = days >= 45 ? [30, 45] : days >= 30 ? [30] : [];
-      thresholds.forEach(t => {
-        const alreadySent = alerts.some(a => a.employee === e.name && a.threshold === t);
-        if (!alreadySent) newAlerts.push({ id: "A" + String(Date.now() + Math.random()).slice(-5), type:"BENCH", employee: e.name, threshold: t, sent_at: today, bench_age: days, recipient: "hr@company.com", skills: e.skills.slice(0,3).map(s=>s.name).join(", ") });
-      });
-    });
-    if (newAlerts.length > 0) setAlerts(prev => [...prev, ...newAlerts]);
-    setGenerated(true);
-  }
-  const sortedAlerts = [...alerts].sort((a,b) => new Date(b.sent_at) - new Date(a.sent_at));
+function Alerts({ employees, alerts, onUnblock, onSnooze }) {
+  const sortedAlerts = [...alerts].sort((a,b) => new Date(b.sent_at).getTime() - new Date(a.sent_at).getTime());
   return (
     <div>
       <div className="page-header" style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
-        <div><div className="page-title">HR Alerts</div><div className="page-sub">Bench-aging alerts and soft-block notifications — sent to HR automatically</div></div>
-        <div style={{ display:"flex", gap:8 }}>
-          {alerts.length > 0 && <button className="btn btn-ghost" style={{ color:T.red, borderColor:T.red }} onClick={onClearAlerts}>🗑 Clear all alerts</button>}
-          <button className="btn btn-amber" onClick={checkAndGenerateAlerts}>⚡ Run alert check</button>
-        </div>
+        <div><div className="page-title">HR Alerts</div><div className="page-sub">Employee changes and bench reminders update automatically</div></div>
       </div>
-      {generated && <div style={{ background:T.greenL, border:`1px solid ${T.green}`, borderRadius:10, padding:"10px 16px", marginBottom:16, fontSize:13, color:T.green, fontWeight:500 }}>✓ Alert check complete — new alerts generated and would be emailed to HR</div>}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(200px, 1fr))", gap:16, marginBottom:20 }}>
-        <div className="stat-card"><div className="stat-value" style={{ color:T.amber }}>{employees.filter(e => e.status!=="MAPPED" && daysSince(e.available_since)>=30 && daysSince(e.available_since)<45).length}</div><div className="stat-label">Day 30 threshold (first alert)</div></div>
-        <div className="stat-card"><div className="stat-value" style={{ color:T.amber }}>{employees.filter(e => e.status==="SOFTBLOCKED").length || alerts.filter(a=>a.type==="SOFTBLOCK").length}</div><div className="stat-label">Active soft-blocks</div></div>
+        <div className="stat-card"><div className="stat-value" style={{ color:T.amber }}>{employees.filter(e => e.status==="AVAILABLE" && daysSince(e.available_since)>=30 && daysSince(e.available_since)<45).length}</div><div className="stat-label">Day 30 threshold (first alert)</div></div>
+        <div className="stat-card"><div className="stat-value" style={{ color:T.amber }}>{employees.filter(e => e.status==="SOFTBLOCKED").length}</div><div className="stat-label">Active soft-blocks</div></div>
         <div className="stat-card"><div className="stat-value" style={{ color:T.red }}>{alerts.filter(a=>a.type==="SOFTBLOCK_EXPIRY").length}</div><div className="stat-label">Soft-block reminders pending</div></div>
       </div>
       <div className="card">
         <div className="card-title" style={{ marginBottom:16 }}>Alert history</div>
         {sortedAlerts.length === 0 ? (
-          <div className="empty"><div className="empty-icon">🔔</div><div className="empty-title">No alerts sent yet</div><div>Run the alert check to generate and log alerts for eligible employees.</div></div>
+          <div className="empty"><div className="empty-icon">🔔</div><div className="empty-title">No activity yet</div><div>Employee changes and bench reminders will appear here automatically.</div></div>
         ) : (
           <div className="table-wrap">
             <table>
@@ -757,18 +726,30 @@ function Alerts({ employees, alerts, setAlerts, onUnblock, onSnooze, onClearAler
                         ? <span className="badge-status badge-mapped">✓ Released</span>
                         : a.type === "SOFTBLOCK_EXPIRY"
                         ? <span className="badge-status badge-rejected">⏰ Reminder</span>
+                        : a.type === "SNOOZE"
+                        ? <span className="badge-status badge-softblock">◷ Snoozed</span>
+                        : a.type === "INGESTION"
+                        ? <span className="badge-status badge-mapped">↑ Ingested</span>
+                        : a.type === "JOB_CREATED"
+                        ? <span className="badge-status badge-mapped">+ Job</span>
                         : <span className={`badge-status ${a.threshold >= 45 ? "badge-rejected" : "badge-softblock"}`}>Day {a.threshold}</span>}
                     </td>
                     <td style={{ fontWeight:600, color: a.type==="SOFTBLOCK" ? T.amber : a.type==="RELEASE" ? T.green : a.type==="SOFTBLOCK_EXPIRY" ? T.red : (a.bench_age>=45?T.red:T.amber) }}>
                       {a.type === "SOFTBLOCK" ? (
                         <div>
-                          <div>{a.job_description || "Opportunity"} <span style={{ fontWeight:400, color:T.muted }}>· by {a.softblocked_by || "Admin"}{a.expiry_date ? ` · expires ${a.expiry_date}` : ""}</span></div>
-                          <div style={{ display:"flex", gap:8, marginTop:6 }}>
+                          <div>{a.job_description || "Opportunity"}{a.company_name ? ` @ ${a.company_name}` : ""} <span style={{ fontWeight:400, color:T.muted }}>· by {a.softblocked_by || "Admin"}{a.expiry_date ? ` · expires ${a.expiry_date}` : ""}</span></div>
+                          {employees.some(e => (e.id === a.employee_id || e.name === a.employee) && e.status === "SOFTBLOCKED") && <div style={{ display:"flex", gap:8, marginTop:6 }}>
                             <button className="btn btn-ghost btn-sm" style={{ color:T.green, borderColor:T.green }} onClick={() => onUnblock && onUnblock(a)}>Release</button>
-                          </div>
+                          </div>}
                         </div>
                       ) : a.type === "RELEASE" ? (
                         <>Released{a.job_description ? <> from {a.job_description}</> : ""}</>
+                      ) : a.type === "SNOOZE" ? (
+                        <>Reminder snoozed until {a.expiry_date}</>
+                      ) : a.type === "INGESTION" ? (
+                        <>{a.rows_processed} employees from {a.filename}{a.neo4j_pending ? " · graph sync pending" : ""}</>
+                      ) : a.type === "JOB_CREATED" ? (
+                        <>{a.job_description}{a.company_name ? ` @ ${a.company_name}` : ""}{a.neo4j_pending ? " · graph sync pending" : ""}</>
                       ) : a.type === "SOFTBLOCK_EXPIRY" ? (
                         <div>
                           <div>{a.job_description} <span style={{ fontWeight:400, color:T.muted }}>· blocked by {a.softblocked_by} · period ended {a.expiry_date}</span></div>
@@ -987,8 +968,8 @@ function GraphExplorer({ alerts, setAlerts, liveEmployees, setLiveEmployees }) {
   const [treeData, setTreeData] = useState(() => buildTree("ALL","ALL",liveEmployees,"","ALL"));
   const [selected, setSelected] = useState(null);
   const [softblockModal, setSoftblockModal] = useState(null);
-  const [sbJobId, setSbJobId] = useState(GRAPH_JOBS[0].id);
-  const [sbManager, setSbManager] = useState("");
+  const [sbCompanyName, setSbCompanyName] = useState("");
+  const [sbJobPosition, setSbJobPosition] = useState("");
 
   useEffect(()=>{
     const newTree = buildTree(skillFilter, statusFilter, liveEmployees, nameQuery, locationFilter);
@@ -1008,18 +989,16 @@ function GraphExplorer({ alerts, setAlerts, liveEmployees, setLiveEmployees }) {
     setSelected(nodeData);
   }
 
-  function executeSoftblock(emp, jobId, managerName) {
-    const job = GRAPH_JOBS.find(j=>j.id===jobId);
-    const jobLabel = job ? job.role+" @ "+job.client : jobId;
+  function executeSoftblock(emp, companyName, jobPosition) {
     const today = new Date().toISOString().split("T")[0];
     const expiry = new Date(Date.now()+SOFTBLOCK_DAYS*86400000).toISOString().split("T")[0];
-    setLiveEmployees(prev => prev.map(e => e.id===emp.id ? { ...e, status:"SOFTBLOCKED", softblock_job:jobLabel, softblock_manager:managerName, softblock_start:today, softblock_expiry:expiry } : e));
+    setLiveEmployees(prev => prev.map(e => e.id===emp.id ? { ...e, status:"SOFTBLOCKED", softblock_job:jobPosition, softblock_company:companyName, softblock_start:today, softblock_expiry:expiry } : e));
 
     fetch(`${API_BASE}/employees/${emp.id}/softblock`, {
       credentials: "include",
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: jobId, manager_name: managerName }),
+      body: JSON.stringify({ company_name: companyName, job_position: jobPosition }),
     }).catch(()=>{});
 
     if (setAlerts) {
@@ -1028,23 +1007,24 @@ function GraphExplorer({ alerts, setAlerts, liveEmployees, setLiveEmployees }) {
         type: "SOFTBLOCK",
         employee: emp.name,
         employee_id: emp.id,
-        job_id: jobId,
-        job_description: jobLabel,
-        softblocked_by: managerName,
+        job_description: jobPosition,
+        company_name: companyName,
+        softblocked_by: 'Admin',
         sent_at: today,
         recipient: "hr@company.com",
       }]);
     }
 
     setSoftblockModal(null);
-    setSbManager("");
+    setSbCompanyName("");
+    setSbJobPosition("");
   }
 
   function executeRelease(emp) {
     const releasedFrom = emp.softblock_job || null;
     const today = new Date().toISOString().split("T")[0];
 
-    setLiveEmployees(prev => prev.map(e => e.id===emp.id ? { ...e, status:"AVAILABLE", softblock_job:null, softblock_manager:null, softblock_start:null, softblock_expiry:null } : e));
+    setLiveEmployees(prev => prev.map(e => e.id===emp.id ? { ...e, status:"AVAILABLE", softblock_job:null, softblock_company:null, softblock_manager:null, softblock_start:null, softblock_expiry:null } : e));
 
     fetch(`${API_BASE}/employees/${emp.id}/release`, { method: "POST", credentials: "include" }).catch(()=>{});
 
@@ -1234,22 +1214,18 @@ function GraphExplorer({ alerts, setAlerts, liveEmployees, setLiveEmployees }) {
             ))}
           </div>
         </div>
-        {selected && <Detail node={selected} employees={liveEmployees} onClose={()=>setSelected(null)} onSoftblock={emp=>{ setSbJobId(GRAPH_JOBS[0].id); setSbManager(""); setSoftblockModal({emp}); }} onRelease={executeRelease} />}
+        {selected && <Detail node={selected} employees={liveEmployees} onClose={()=>setSelected(null)} onSoftblock={emp=>{ setSbCompanyName(""); setSbJobPosition(""); setSoftblockModal({emp}); }} onRelease={executeRelease} />}
       </div>
       {softblockModal && (
         <div className="modal-overlay" onClick={()=>setSoftblockModal(null)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <div className="modal-title">Soft-block {softblockModal.emp.name}</div>
-            <div className="form-group"><label className="form-label">Job ID</label>
-              <select className="form-select" value={sbJobId} onChange={e=>setSbJobId(e.target.value)}>
-                {GRAPH_JOBS.map(j=><option key={j.id} value={j.id}>{j.id} — {j.role} @ {j.client}</option>)}
-              </select>
-            </div>
-            <div className="form-group"><label className="form-label">Soft-block manager name</label><input className="form-input" value={sbManager} onChange={e=>setSbManager(e.target.value)} placeholder="e.g. Rohan Gupta" /></div>
+            <div className="form-group"><label className="form-label">Company Name</label><input className="form-input" value={sbCompanyName} onChange={e=>setSbCompanyName(e.target.value)} placeholder="e.g. Acme" /></div>
+            <div className="form-group"><label className="form-label">Job Position</label><input className="form-input" value={sbJobPosition} onChange={e=>setSbJobPosition(e.target.value)} placeholder="e.g. Software Engineer" /></div>
             <div style={{ fontSize:12, color:COL.muted, marginBottom:4 }}>Soft-block period: {SOFTBLOCK_DAYS} days from today</div>
             <div className="modal-actions">
               <button className="btn btn-ghost" onClick={()=>setSoftblockModal(null)}>Cancel</button>
-              <button className="btn btn-primary" disabled={!sbManager.trim()} onClick={()=>executeSoftblock(softblockModal.emp, sbJobId, sbManager.trim())}>Confirm soft-block</button>
+              <button className="btn btn-primary" disabled={!sbCompanyName.trim() || !sbJobPosition.trim()} onClick={()=>executeSoftblock(softblockModal.emp, sbCompanyName.trim(), sbJobPosition.trim())}>Confirm soft-block</button>
             </div>
           </div>
         </div>
@@ -1410,8 +1386,10 @@ function GraphView({ user, setEmployees, setAlerts }) {
   } = useOntologyExplorer();
 
   const graphRef = useRef(null);
-  const [sbForm, setSbForm] = useState({ job_id: '', manager_name: '' });
+  const [sbForm, setSbForm] = useState({ company_name: '', job_position: '' });
   const [showSoftblockForm, setShowSoftblockForm] = useState(false);
+  const [graphActionLoading, setGraphActionLoading] = useState(false);
+  const [graphActionError, setGraphActionError] = useState('');
 
   async function handleFilterChange(filters, benchRange) {
     setFilters({ ...filters, ...benchRange });
@@ -1459,8 +1437,10 @@ function GraphView({ user, setEmployees, setAlerts }) {
   async function handleAction(action, empId) {
     if (!user) return alert("Please log in first");
     const todayStr = new Date().toISOString().split("T")[0];
+    setGraphActionLoading(true);
+    setGraphActionError('');
     try {
-      const payload = action === 'softblock' ? { job_id: sbForm.job_id, job_label: sbForm.job_id, manager_name: sbForm.manager_name } : {};
+      const payload = action === 'softblock' ? { company_name: sbForm.company_name.trim(), job_position: sbForm.job_position.trim() } : {};
       const res = await fetch(`${API_BASE}/employees/${encodeURIComponent(empId)}/${action}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1469,27 +1449,21 @@ function GraphView({ user, setEmployees, setAlerts }) {
       });
       if (res.ok) {
         const resData = await parseJsonSafe(res);
+        const updatedStatus = resData?.status || (action === 'softblock' ? 'SOFTBLOCKED' : 'AVAILABLE');
+        const updatedFields = {
+          status: updatedStatus,
+          softblock_job: action === 'softblock' ? payload.job_position : null,
+          softblock_company: action === 'softblock' ? payload.company_name : null,
+          softblock_manager: action === 'softblock' ? (payload.manager_name || user?.name || 'Admin') : null,
+          softblock_start: action === 'softblock' ? todayStr : null,
+          softblock_expiry: action === 'softblock' ? new Date(Date.now() + 15 * 86400000).toISOString().split('T')[0] : null
+        };
         setEmployees(prev => prev.map(emp => {
           if (emp.id !== empId && emp.name !== empId) return emp;
-          return {
-            ...emp,
-            status: action === "softblock" ? "SOFTBLOCKED" : "AVAILABLE",
-            softblock_job: action === "softblock" ? (payload.job_label || payload.job_id || "Opportunity") : null,
-            softblock_manager: action === "softblock" ? (payload.manager_name || user?.name || "Admin") : null,
-            softblock_start: action === "softblock" ? todayStr : null,
-            softblock_expiry: action === "softblock" ? new Date(Date.now() + 15 * 86400000).toISOString().split("T")[0] : null
-          };
+          return { ...emp, ...updatedFields };
         }));
-        
-        // Also update local selectedNode to reflect changes instantly in the panel
-        setSelectedNode(prev => ({
-          ...prev,
-          status: action === "softblock" ? "SOFTBLOCKED" : "AVAILABLE",
-          softblock_job: action === "softblock" ? (payload.job_label || payload.job_id || "Opportunity") : null,
-          softblock_manager: action === "softblock" ? (payload.manager_name || user?.name || "Admin") : null,
-          softblock_start: action === "softblock" ? todayStr : null,
-          softblock_expiry: action === "softblock" ? new Date(Date.now() + 15 * 86400000).toISOString().split("T")[0] : null
-        }));
+        setGraph(prev => ({ ...prev, nodes: prev.nodes.map(node => node.id === empId ? { ...node, ...updatedFields } : node) }));
+        setSelectedNode(prev => prev ? { ...prev, ...updatedFields } : prev);
 
         if (setAlerts) {
           if (action === "softblock") {
@@ -1498,13 +1472,14 @@ function GraphView({ user, setEmployees, setAlerts }) {
               type: "SOFTBLOCK",
               employee: selectedNode.label || selectedNode.id,
               employee_id: empId,
-              job_description: payload.job_label || payload.job_id || "Opportunity",
-              softblocked_by: payload.manager_name || user?.name || "Admin",
+              job_description: payload.job_position,
+              company_name: payload.company_name,
+              softblocked_by: user?.name || "Admin",
               expiry_date: new Date(Date.now() + 15 * 86400000).toISOString().split("T")[0],
               sent_at: todayStr,
               recipient: "hr@company.com"
             };
-            setAlerts(prev => [newAlert, ...prev.filter(a => !(a.employee === (selectedNode.label || selectedNode.id) && a.type === "RELEASE"))]);
+            setAlerts(prev => [newAlert, ...prev]);
           } else if (action === "release") {
             const newAlert = resData?.alert || {
               id: "REL" + String(Date.now()).slice(-6),
@@ -1515,17 +1490,20 @@ function GraphView({ user, setEmployees, setAlerts }) {
               sent_at: todayStr,
               recipient: "hr@company.com"
             };
-            setAlerts(prev => [newAlert, ...prev.filter(a => !(a.employee === (selectedNode.label || selectedNode.id) && a.type === "SOFTBLOCK"))]);
+            setAlerts(prev => [newAlert, ...prev]);
           }
         }
         
         setShowSoftblockForm(false);
+        setSbForm({ company_name: '', job_position: '' });
       } else {
         const d = await parseJsonSafe(res);
-        alert(d?.error || "Action failed");
+        setGraphActionError(d?.error || "Action failed");
       }
     } catch (e) {
-      alert("Error: " + e.message);
+      setGraphActionError("Error: " + e.message);
+    } finally {
+      setGraphActionLoading(false);
     }
   }
 
@@ -1556,15 +1534,16 @@ function GraphView({ user, setEmployees, setAlerts }) {
           <OntologyGraph 
             ref={graphRef}
             graph={graph}
+            selectedNode={selectedNode}
             rootNode={rootNode}
             expandedNodeIds={expandedNodeIds}
             onNodeExpand={expandNodeInGraph}
             onNodeCollapse={collapseNodeInGraph}
-            onNodeSelect={(n) => setSelectedNode(n)}
+            onNodeSelect={(n) => { setSelectedNode(n); setShowSoftblockForm(false); setGraphActionError(''); }}
             isLoading={isLoading}
           />
           
-          {selectedNode && (selectedNode.type === 'Employee' || selectedNode.id === rootNode) && (
+          {selectedNode?.type === 'Employee' && (
             <div style={{
               position: "absolute", top: 16, right: 16, width: 320, background: "#ffffff",
               border: "1px solid #E2E6EF", borderRadius: 12, padding: 20,
@@ -1586,17 +1565,23 @@ function GraphView({ user, setEmployees, setAlerts }) {
                   <strong>Bench Since:</strong> {selectedNode.available_since}
                 </div>
               )}
+              {selectedNode.status === 'SOFTBLOCKED' && selectedNode.softblock_job && (
+                <div style={{ marginBottom: 8, fontSize: 13, color: "#4B5563" }}>
+                  <strong>Soft-blocked for:</strong> {[selectedNode.softblock_job, selectedNode.softblock_company].filter(Boolean).join(' @ ')}
+                </div>
+              )}
+              {graphActionError && <div role="alert" style={{ color: T.red, fontSize: 12 }}>{graphActionError}</div>}
               <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 20 }}>
                 {(!selectedNode.status || selectedNode.status === 'AVAILABLE') ? (
                   showSoftblockForm ? (
                     <div style={{ padding: 12, background: "#FFFBEB", borderRadius: 8 }}>
                       <div style={{ fontWeight: 600, color: "#B8710F", marginBottom: 8 }}>Soft-block Details</div>
                       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
-                        <input type="text" className="form-input" placeholder="Job ID (e.g., J001)" value={sbForm.job_id} onChange={e => setSbForm(prev => ({...prev, job_id: e.target.value}))} />
-                        <input type="text" className="form-input" placeholder="Manager Name" value={sbForm.manager_name} onChange={e => setSbForm(prev => ({...prev, manager_name: e.target.value}))} />
+                        <input type="text" className="form-input" placeholder="Company Name" value={sbForm.company_name} onChange={e => setSbForm(prev => ({...prev, company_name: e.target.value}))} />
+                        <input type="text" className="form-input" placeholder="Job Position" value={sbForm.job_position} onChange={e => setSbForm(prev => ({...prev, job_position: e.target.value}))} />
                       </div>
                       <div style={{ display: "flex", gap: 8 }}>
-                        <button className="btn btn-primary btn-sm" onClick={() => handleAction('softblock', selectedNode.id)}>Submit</button>
+                        <button className="btn btn-primary btn-sm" disabled={graphActionLoading || !sbForm.company_name.trim() || !sbForm.job_position.trim()} onClick={() => handleAction('softblock', selectedNode.id)}>{graphActionLoading ? 'Saving…' : 'Confirm Soft-block'}</button>
                         <button className="btn btn-ghost btn-sm" onClick={() => setShowSoftblockForm(false)}>Cancel</button>
                       </div>
                     </div>
@@ -1607,7 +1592,7 @@ function GraphView({ user, setEmployees, setAlerts }) {
                   )
                 ) : (
                   <>
-                    <button onClick={() => handleAction('release', selectedNode.id)} className="btn" style={{ background: "#FDECEA", color: "#C0392B", width: "100%", justifyContent: "center" }}>
+                    <button disabled={graphActionLoading} onClick={() => handleAction('release', selectedNode.id)} className="btn" style={{ background: "#FDECEA", color: "#C0392B", width: "100%", justifyContent: "center" }}>
                       Release Employee
                     </button>
                   </>
@@ -1749,6 +1734,9 @@ export default function TalentLens() {
     try {
       await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "include" });
       setUser(null);
+      setAlerts([]);
+      knownAlertIds.current = null;
+      setNewAlertToast(null);
     } catch (err) {
       console.error(err);
     }
@@ -1757,10 +1745,29 @@ export default function TalentLens() {
   const [employees, setEmployees] = useState([]);
   const [jobs, setJobs] = useState(INITIAL_JOBS);
   const [alerts, setAlerts] = useState([]);
+  const [newAlertToast, setNewAlertToast] = useState(null);
+  const knownAlertIds = useRef(null);
   const [graphEmployees, setGraphEmployees] = useState([]);
   const [notifiedExpiries, setNotifiedExpiries] = useState([]);
   const [tick, setTick] = useState(0);
   const [apiConnected, setApiConnected] = useState(false);
+
+  useEffect(() => {
+    if (!knownAlertIds.current) return;
+    const incoming = alerts.filter(a => a.id && !knownAlertIds.current.has(a.id));
+    alerts.forEach(a => { if (a.id) knownAlertIds.current.add(a.id); });
+    if (incoming.length) {
+      const latest = incoming[incoming.length - 1];
+      const action = latest.type === "SOFTBLOCK" ? "soft-blocked" : latest.type === "RELEASE" ? "released" : latest.type === "SNOOZE" ? "snoozed" : latest.type === "INGESTION" ? "ingested" : latest.type === "JOB_CREATED" ? "created" : "has a new alert";
+      setNewAlertToast(incoming.length === 1 ? `${latest.employee} ${action}` : `${incoming.length} new alerts and employee changes`);
+    }
+  }, [alerts]);
+
+  useEffect(() => {
+    if (!newAlertToast) return;
+    const timer = setTimeout(() => setNewAlertToast(null), 6000);
+    return () => clearTimeout(timer);
+  }, [newAlertToast]);
 
   // periodic re-check so a running session catches date rollovers too
   useEffect(() => {
@@ -1781,7 +1788,13 @@ export default function TalentLens() {
       fetch(`${API_BASE}/alerts`, { credentials: "include" })
         .then(res => parseJsonSafe(res))
         .then(data => {
-          if (Array.isArray(data)) setAlerts(data);
+          if (Array.isArray(data)) {
+            if (!knownAlertIds.current) {
+              knownAlertIds.current = new Set(data.map(a => a.id).filter(Boolean));
+              if (data.length) setNewAlertToast(`${data.length} alerts are ready to review`);
+            }
+            setAlerts(data);
+          }
         })
         .catch(console.error);
     }
@@ -1797,6 +1810,10 @@ export default function TalentLens() {
         if (!res.ok) return;
         const apiEmployees = await parseJsonSafe(res);
         if (cancelled || !Array.isArray(apiEmployees)) return;
+        setEmployees(prev => [
+          ...apiEmployees,
+          ...prev.filter(local => local.local_only && !apiEmployees.some(saved => saved.id === local.id || saved.name === local.name)),
+        ]);
         setGraphEmployees(prev => prev.map(local => {
           const match = apiEmployees.find(a => a.id === local.id);
           if (!match) return local;
@@ -1806,6 +1823,7 @@ export default function TalentLens() {
             location: match.location ?? local.location,
             bench_days: match.available_since ? daysSince(match.available_since) : local.bench_days,
             softblock_job: match.softblock_job ?? null,
+            softblock_company: match.softblock_company ?? null,
             softblock_manager: match.softblock_manager ?? null,
             softblock_start: match.softblock_start ?? null,
             softblock_expiry: match.softblock_expiry ?? null,
@@ -1820,11 +1838,11 @@ export default function TalentLens() {
         if (res2.ok) {
           const apiAlerts = await parseJsonSafe(res2);
           if (!cancelled && Array.isArray(apiAlerts)) {
-            setAlerts(prev => {
-              const existingIds = new Set(prev.map(a => a.id));
-              const fresh = apiAlerts.filter(a => !existingIds.has(a.id));
-              return fresh.length ? [...prev, ...fresh] : prev;
-            });
+            if (!knownAlertIds.current) {
+              knownAlertIds.current = new Set(apiAlerts.map(a => a.id).filter(Boolean));
+              if (apiAlerts.length) setNewAlertToast(`${apiAlerts.length} alerts are ready to review`);
+            }
+            setAlerts(apiAlerts);
           }
         }
       } catch (err) { /* backend not reachable yet, ignore */ }
@@ -1865,42 +1883,46 @@ export default function TalentLens() {
     }
   }, [graphEmployees, notifiedExpiries, tick]);
 
-  function handleUnblockFromAlert(alert) {
-    const todayStr = new Date().toISOString().split("T")[0];
+  async function handleUnblockFromAlert(alert) {
     const empIdentifier = alert.employee_id || alert.employee;
+    try {
+      const res = await fetch(`${API_BASE}/employees/${encodeURIComponent(empIdentifier)}/release`, { method: "POST", credentials: "include" });
+      const data = await parseJsonSafe(res);
+      if (!res.ok) throw new Error(data?.error || "Release failed");
+      setAlerts(prev => [data.alert, ...prev.filter(a => a.id !== data.alert.id)]);
+    } catch (error) {
+      window.alert(error.message);
+      return;
+    }
     setEmployees(prev => prev.map(e => (e.id === empIdentifier || e.name === alert.employee)
-      ? { ...e, status:"AVAILABLE", softblock_job:null, softblock_manager:null, softblock_start:null, softblock_expiry:null }
+      ? { ...e, status:"AVAILABLE", softblock_job:null, softblock_company:null, softblock_manager:null, softblock_start:null, softblock_expiry:null }
       : e));
     setGraphEmployees(prev => prev.map(e => (e.id === empIdentifier || e.name === alert.employee)
-      ? { ...e, status:"AVAILABLE", softblock_job:null, softblock_manager:null, softblock_start:null, softblock_expiry:null }
+      ? { ...e, status:"AVAILABLE", softblock_job:null, softblock_company:null, softblock_manager:null, softblock_start:null, softblock_expiry:null }
       : e));
-    fetch(`${API_BASE}/employees/${encodeURIComponent(empIdentifier)}/release`, { method: "POST", credentials: "include" }).catch(()=>{});
-    setAlerts(prev => [
-      {
-        id: "REL" + String(Date.now()).slice(-6),
-        type: "RELEASE",
-        employee: alert.employee,
-        employee_id: alert.employee_id,
-        job_description: alert.job_description,
-        sent_at: todayStr,
-        recipient: "hr@company.com",
-      },
-      ...prev.filter(a => !(a.employee === alert.employee && (a.type === "SOFTBLOCK" || a.type === "SOFTBLOCK_EXPIRY")))
-    ]);
   }
 
-  function handleSnoozeFromAlert(alert) {
-    const newExpiry = new Date(Date.now()+SOFTBLOCK_DAYS*86400000).toISOString().split("T")[0];
+  async function handleSnoozeFromAlert(alert) {
+    let newExpiry;
+    try {
+      const res = await fetch(`${API_BASE}/employees/${encodeURIComponent(alert.employee_id || alert.employee)}/snooze`, { method: "POST", credentials: "include" });
+      const data = await parseJsonSafe(res);
+      if (!res.ok) throw new Error(data?.error || "Snooze failed");
+      newExpiry = data.expiry_date;
+      setAlerts(prev => [data.alert, ...prev.filter(a => a.id !== data.alert.id)]);
+    } catch (error) {
+      window.alert(error.message);
+      return;
+    }
     setEmployees(prev => prev.map(e => (e.id === alert.employee_id || e.name === alert.employee)
       ? { ...e, softblock_expiry:newExpiry }
       : e));
     setGraphEmployees(prev => prev.map(e => (e.id === alert.employee_id || e.name === alert.employee)
       ? { ...e, softblock_expiry:newExpiry }
       : e));
-    fetch(`${API_BASE}/employees/${encodeURIComponent(alert.employee_id || alert.employee)}/snooze`, { method: "POST", credentials: "include" }).catch(()=>{});
   }
 
-  const alertsNeeded = employees.filter(e => e.status !== "MAPPED" && daysSince(e.available_since) >= 30).length;
+  const alertsNeeded = alerts.length;
   return (
     <>
       <style>{css}</style>
@@ -1939,6 +1961,11 @@ export default function TalentLens() {
         </div>
       )}
       <div className="app">
+        {newAlertToast && <div role="status" onClick={() => { setPage("alerts"); setNewAlertToast(null); }} style={{ position:"fixed", top:18, right:18, zIndex:1200, background:T.navy, color:"#fff", padding:"14px 18px", borderRadius:10, boxShadow:"0 10px 30px rgba(0,0,0,.2)", cursor:"pointer", maxWidth:320 }}>
+          <div style={{ fontWeight:700, marginBottom:4 }}>New activity</div>
+          <div style={{ fontSize:13 }}>{newAlertToast}</div>
+          <div style={{ fontSize:11, color:"#A8E4E7", marginTop:7 }}>Open alerts →</div>
+        </div>}
         <div className="sidebar">
           <div className="sidebar-logo"><div className="sidebar-logo-text">TalentLens</div><div className="sidebar-logo-sub">bench management</div></div>
           <div className="nav-section">Navigation</div>
@@ -1953,6 +1980,8 @@ export default function TalentLens() {
           <div className="ticker">
             <div className="ticker-stat"><div className="ticker-label">On bench</div><div style={{ fontSize:18, fontWeight:700, color:"#fff" }}>{employees.filter(e=>e.status==="AVAILABLE").length}</div></div>
             <div className="ticker-divider"/>
+            <div className="ticker-stat"><div className="ticker-label">Soft-blocked</div><div style={{ fontSize:18, fontWeight:700, color:T.amber }}>{employees.filter(e=>e.status==="SOFTBLOCKED").length}</div></div>
+            <div className="ticker-divider"/>
             <div className="ticker-stat"><div className="ticker-label">Critical (45d+)</div><div style={{ fontSize:18, fontWeight:700, color:T.red }}>{employees.filter(e=>e.status!=="MAPPED"&&daysSince(e.available_since)>=45).length}</div></div>
             <div className="ticker-divider"/>
             <div className="ticker-stat"><div className="ticker-label">Open jobs</div><div style={{ fontSize:18, fontWeight:700, color:T.green }}>{jobs.filter(j=>j.status==="OPEN").length}</div></div>
@@ -1963,7 +1992,7 @@ export default function TalentLens() {
             {page === "employees" && <Employees employees={employees} setEmployees={setEmployees} user={user} setAlerts={setAlerts} />}
             {page === "jobs" && <Jobs jobs={jobs} setJobs={setJobs} employees={employees} />}
             {page === "interviews" && <Interviews employees={employees} setEmployees={setEmployees} />}
-            {page === "alerts" && <Alerts employees={employees} alerts={alerts} setAlerts={setAlerts} onUnblock={handleUnblockFromAlert} onSnooze={handleSnoozeFromAlert} onClearAlerts={async () => { try { await fetch(`${API_BASE}/alerts/clear`, { method: "POST", credentials: "include" }); } catch {} setAlerts([]); }} />}
+            {page === "alerts" && <Alerts employees={employees} alerts={alerts} onUnblock={handleUnblockFromAlert} onSnooze={handleSnoozeFromAlert} />}
             {page === "graph" && <GraphView user={user} setEmployees={setEmployees} setAlerts={setAlerts} />}
             {page === "ingestion" && <Ingestion user={user} />}
           </div>

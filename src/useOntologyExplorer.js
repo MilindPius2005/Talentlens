@@ -112,6 +112,7 @@ export function useOntologyExplorer(initialFilters = {}) {
     setSearchResults([]);
     setPendingGraphRoot(null);
     setSearchQuery('');
+    setSelectedNode(null);
     setRootNode(targetRoot);
     setIsLoading(true);
 
@@ -148,6 +149,7 @@ export function useOntologyExplorer(initialFilters = {}) {
   const loadGraph = useCallback(async (rootId) => {
     if (!rootId) return;
     setRootNode(rootId);
+    setSelectedNode(null);
     setSearchResults([]);
     setPendingGraphRoot(null);
     setIsLoading(true);

@@ -310,18 +310,10 @@ const OntologyGraph = forwardRef(function OntologyGraph(
       .style('pointer-events', 'none')
       .attr('opacity', (d) => expandedNodeIds?.has(d.id) ? 1 : 0);
 
-    // Selection ring
-    nodeGs.append('circle').attr('class', 's-ring')
-      .attr('r', (d) => getStyle(d.type).radius + 5)
-      .attr('fill', 'none')
-      .attr('stroke', (d) => d.id === selectedNode?.id ? '#2563EB' : 'transparent')
-      .attr('stroke-width', 3)
-      .style('pointer-events', 'none');
-
     // Main circle
     nodeGs.append('circle').attr('class', 'node-circle')
       .attr('r', (d) => getStyle(d.type).radius)
-      .attr('fill', (d) => getStyle(d.type).color)
+      .attr('fill', (d) => d.type === 'Employee' && d.status === 'SOFTBLOCKED' ? '#B8710F' : getStyle(d.type).color)
       .attr('stroke', '#FFFFFF').attr('stroke-width', 3)
       .attr('filter', 'url(#node-shadow)');
 
@@ -359,6 +351,7 @@ const OntologyGraph = forwardRef(function OntologyGraph(
         return '#64748B';
       })
       .text((d) => {
+        if (d.type === 'Employee' && d.status === 'SOFTBLOCKED') return 'Soft-blocked';
         if (expandedNodeIds?.has(d.id)) return 'expanded ↓';
         if (d.id === rootNode) return '● Root';
         return d.type || 'Node';
@@ -432,12 +425,8 @@ const OntologyGraph = forwardRef(function OntologyGraph(
     container.selectAll('g.ng').each(function (d) {
       const g = d3.select(this);
       const isExp = expandedNodeIds?.has(d.id);
-      const isSel = d.id === selectedNode?.id;
-
       g.select('circle.c-ring')
         .attr('opacity', isExp ? 1 : 0);
-      g.select('circle.s-ring')
-        .attr('stroke', isSel ? '#2563EB' : 'transparent');
       g.select('text.n-sub')
         .attr('fill', isExp ? '#059669' : d.id === rootNode ? '#2563EB' : '#64748B')
         .text(isExp ? 'expanded ↓' : d.id === rootNode ? '● Root' : d.type || 'Node');
@@ -447,15 +436,6 @@ const OntologyGraph = forwardRef(function OntologyGraph(
   return (
     <div ref={wrapperRef} style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden', background: '#FAFBFF' }}>
       <svg ref={svgRef} style={{ display: 'block', width: '100%', height: '100%' }} />
-
-      {/* Empty state */}
-      {(!graph.nodes || graph.nodes.length === 0) && !isLoading && (
-        <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%,-50%)', textAlign: 'center', color: '#94A3B8', pointerEvents: 'none' }}>
-          <div style={{ fontSize: 40, marginBottom: 14 }}>🕸️</div>
-          <div style={{ fontSize: 16, fontWeight: 700, color: '#475569', marginBottom: 6 }}>Search a node to begin</div>
-          <div style={{ fontSize: 13 }}>Type a name or use filters on the left, then click <b>Generate Knowledge Graph</b>.</div>
-        </div>
-      )}
 
       {isLoading && (
         <div style={{ position: 'absolute', top: 16, left: 16, background: 'rgba(255,255,255,0.95)', border: '1px solid #E2E8F0', borderRadius: 8, padding: '6px 14px', fontSize: 12, fontWeight: 700, color: '#0A7C88', boxShadow: '0 2px 8px rgba(0,0,0,0.07)', zIndex: 15 }}>
