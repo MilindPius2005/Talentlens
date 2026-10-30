@@ -57,6 +57,11 @@ def save_import(db, records, owner, upload_id):
     for record in records:
         fields = {key: record.get(key) for key in TEXT_FIELDS
                   if not key.startswith('softblock_')}
+        client_name = fields.get('client_name')
+        if not client_name or str(client_name).strip().lower() in ('na', 'n/a', 'none', 'null', 'nan', 'no client', 'no clients'):
+            fields['client_name'] = None
+            if not fields.get('deployment_status'):
+                fields['deployment_status'] = 'AVAILABLE'
         fields.update({key: record.get(key, []) for key in LIST_FIELDS})
         existing = db['employees'].find_one({'emp_name': record['emp_name']}, {'status': 1})
         if (existing or record).get('status') == 'SOFTBLOCKED':
@@ -69,7 +74,7 @@ def save_import(db, records, owner, upload_id):
                 'sync_version': uuid4().hex, 'schema_version': 2,
             }, '$setOnInsert': {
                 'id': record['emp_name'], 'emp_name': record['emp_name'],
-                'status': record.get('status', 'AVAILABLE'), 'created_at': now,
+                'status': record.get('status') or 'AVAILABLE', 'created_at': now,
                 **{key: record.get(key) for key in TEXT_FIELDS if key.startswith('softblock_')},
             }}, upsert=True,
         )
@@ -162,6 +167,8 @@ def sync_employees(db, driver_factory, database, employees):
 
 def public_employee(employee):
     result = {key: value for key, value in employee.items() if key != '_id'}
+    if result.get('status') != 'SOFTBLOCKED' and not result.get('deployment_status') and not result.get('client_name'):
+        result['deployment_status'] = 'AVAILABLE'
     result['name'] = employee['emp_name']
     result['neo4j_pending'] = not employee.get('neo4j_synced', False)
     result['location'] = ', '.join(employee.get('location', [])) or None

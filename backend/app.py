@@ -165,7 +165,7 @@ def employee_record_batches():
     employees = list(mongo_db['employees'].find({}))
     yield {'records': employees}
     names = {employee['emp_name'] for employee in employees}
-    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$ne': 'job'}}):
+    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$nin': ['job', 'job_delete']}}):
         records = [rec for rec in job.get('records', [])
                    if rec.get('emp_name') and rec['emp_name'] not in names]
         names.update(rec['emp_name'] for rec in records)
@@ -178,15 +178,13 @@ def get_pending_queue_data():
     try:
         for job in employee_record_batches():
             for rec in job.get('records', []):
-                deployment_status = normalize_optional_text(rec.get('deployment_status')) or rec.get('status')
-                if not rec.get('sync_version') and rec.get('status') == 'SOFTBLOCKED':
-                    deployment_status = 'SOFTBLOCKED'
+                deployment_status = effective_deployment_status(rec)
                 if deployment_status:
                     result['deployment_statuses'].add(deployment_status.upper())
                 for sk in rec.get('skills', []) + rec.get('misc_skills', []):
                     if sk: result['skills'].add(sk)
-                cn = rec.get('client_name')
-                if normalize_optional_text(cn): result['clients'].add(cn)
+                cn = normalize_client_name(rec.get('client_name'))
+                if cn: result['clients'].add(cn)
                 
                 loc = rec.get('location')
                 if loc:
@@ -403,14 +401,13 @@ def get_employees():
                     continue
 
                 all_skills = rec.get('skills', []) + rec.get('misc_skills', [])
-                rec_client = normalize_optional_text(rec.get('client_name'))
+                rec_client = normalize_client_name(rec.get('client_name'))
                 if client == '__NO_CLIENT__' and rec_client: continue
                 if client and client != '__NO_CLIENT__' and rec.get('client_name') != client: continue
                 if location and location not in rec.get('location', []): continue
                 if domain and domain not in rec.get('domain', []): continue
                 if level and level not in rec.get('level', []): continue
-                rec_status = ('SOFTBLOCKED' if not rec.get('sync_version') and rec.get('status') == 'SOFTBLOCKED' else
-                              (normalize_optional_text(rec.get('deployment_status')) or rec.get('status') or '')).upper()
+                rec_status = effective_deployment_status(rec) or ''
                 if status and status.strip().upper() != rec_status: continue
                 if search and search.lower() not in emp_name.lower(): continue
                 if skill_filter and not all(sk in all_skills for sk in skill_filter): continue
@@ -432,9 +429,9 @@ def get_employees():
                 employees.append({
                     'id': emp_name,
                     'name': emp_name,
-                    'status': rec.get('status', 'AVAILABLE'),
-                    'deployment_status': rec.get('deployment_status'),
-                    'client_name': rec.get('client_name'),
+                    'status': rec.get('status') or ('AVAILABLE' if not rec_client else None),
+                    'deployment_status': rec_status or None,
+                    'client_name': rec_client,
                     'current_project': rec.get('current_project'),
                     'performance': rec.get('performance'),
                     'available_since': avail_date_str,
@@ -624,66 +621,143 @@ def snooze_employee(emp_id):
                     'expiry_date': expiry,
                     'alert': {k: v for k, v in alert_doc.items() if k != '_id'}})
 
-@app.route('/jobs', methods=['POST', 'OPTIONS'])
+def public_job(job):
+    return {key: value for key, value in job.items() if key not in ('_id', 'created_by')}
+
+
+def sync_job_to_graph(job):
+    with get_neo4j_driver() as driver:
+        with driver.session(database=NEO4J_DATABASE) as session:
+            session.run("""
+                MERGE (j:Job {id: $job_id})
+                SET j.role = $role, j.status = $status,
+                    j.description = $description, j.name = $role
+            """, job_id=job['id'], role=job['role'], status=job['status'],
+                description=job['description']).consume()
+            if job['client']:
+                session.run("""
+                    MATCH (j:Job {id: $job_id})
+                    MERGE (c:Client {name: $client})
+                    MERGE (j)-[:FOR_CLIENT]->(c)
+                """, job_id=job['id'], client=job['client']).consume()
+            if job['location']:
+                session.run("""
+                    MATCH (j:Job {id: $job_id})
+                    MERGE (l:Location {name: $location})
+                    MERGE (j)-[:IN_LOCATION]->(l)
+                """, job_id=job['id'], location=job['location']).consume()
+
+
+def delete_job_from_graph(job_id):
+    with get_neo4j_driver() as driver:
+        with driver.session(database=NEO4J_DATABASE) as session:
+            session.run('MATCH (j:Job {id: $job_id}) DETACH DELETE j', job_id=job_id).consume()
+
+
+@app.route('/jobs', methods=['GET', 'POST', 'OPTIONS'])
 def add_job():
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
     if not user: return jsonify({"error": "Unauthorized"}), 401
-    
-    data = request.json
-    job_id = data.get('id')
-    role = data.get('role', '')
-    client = data.get('client', '')
-    location = data.get('location', '')
-    status = data.get('status', 'OPEN')
-    description = data.get('description', '')
-    def log_job_creation(pending=False):
-        mongo_db['alerts'].insert_one({
-            'id': f"JOB-{uuid.uuid4().hex[:8]}", 'type': 'JOB_CREATED',
-            'employee': role or 'New position', 'job_description': role,
-            'company_name': client, 'neo4j_pending': pending,
-            'sent_at': datetime.now(timezone.utc).isoformat(),
-            'recipient': 'hr@company.com'
-        })
-    
+    if request.method == 'GET':
+        jobs = [public_job(job) for job in mongo_db['jobs'].find({})]
+        # Jobs created before MongoDB persistence was added can still be removed.
+        for queued in mongo_db['pending_neo4j_queue'].find({'type': 'job'}):
+            for index, record in enumerate(queued.get('records', [])):
+                jobs.append({
+                    'id': f"legacy-{queued['_id']}-{index}",
+                    'role': record.get('job_role', ''),
+                    'client': record.get('client_name', ''),
+                    'location': record.get('location', ''),
+                    'status': 'OPEN', 'description': '', 'required_skills': [],
+                    'open_date': queued.get('today') or '', 'neo4j_synced': False,
+                })
+        return jsonify(sorted(jobs, key=lambda job: job.get('open_date', ''), reverse=True))
+
+    data = request.get_json(silent=True) or {}
+    role = str(data.get('role') or '').strip()
+    if not role:
+        return jsonify({'error': 'Role title is required.'}), 400
+    skills = data.get('required_skills', [])
+    if not isinstance(skills, list):
+        return jsonify({'error': 'Required skills must be a list.'}), 400
+    job = {
+        'id': uuid.uuid4().hex,
+        'role': role,
+        'client': str(data.get('client') or '').strip(),
+        'location': str(data.get('location') or '').strip(),
+        'status': 'OPEN',
+        'open_date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+        'description': str(data.get('description') or '').strip(),
+        'required_skills': skills,
+        'created_by': str(user['_id']),
+        'neo4j_synced': False,
+    }
+    mongo_db['jobs'].insert_one(job)
+    pending = True
     try:
-        with get_neo4j_driver() as driver:
-            with driver.session(database=NEO4J_DATABASE) as session:
-                session.run("""
-                    MERGE (j:Job {id: $job_id})
-                    SET j.role = $role, j.status = $status, j.description = $description, j.name = $role
-                    WITH j
-                    WHERE $client <> ''
-                    MERGE (c:Client {name: $client})
-                    MERGE (j)-[:FOR_CLIENT]->(c)
-                """, job_id=job_id, role=role, status=status, description=description, client=client)
-                
-                if location:
-                    session.run("""
-                        MATCH (j:Job {id: $job_id})
-                        MERGE (l:Location {name: $location})
-                        MERGE (j)-[:IN_LOCATION]->(l)
-                    """, job_id=job_id, location=location)
-                
-                # We could add required skills here if we wanted, but not strictly necessary for client filter 
-                # unless they want jobs to show up in skill filters.
-                # Just store them as properties or relationships.
-                
-        log_job_creation()
-        return jsonify({"status": "success"})
-    except Exception as e:
-        print(f"Error adding job to Neo4j: {e}")
-        if client:
-            mongo_db['pending_neo4j_queue'].insert_one({
-                'type': 'job',
-                'records': [{
-                    'client_name': client,
-                    'job_role': role,
-                    'location': location
-                }]
-            })
-        log_job_creation(pending=True)
-        return jsonify({"status": "success", "neo4j_pending": True})
+        sync_job_to_graph(job)
+        mongo_db['jobs'].update_one({'id': job['id']}, {'$set': {'neo4j_synced': True}})
+        job['neo4j_synced'] = True
+        pending = False
+    except Exception as error:
+        app.logger.warning('Job graph sync pending: %s', type(error).__name__)
+    mongo_db['alerts'].insert_one({
+        'id': f"JOB-{uuid.uuid4().hex[:8]}", 'type': 'JOB_CREATED',
+        'employee': role, 'job_description': role,
+        'company_name': job['client'], 'neo4j_pending': pending,
+        'sent_at': datetime.now(timezone.utc).isoformat(),
+        'recipient': 'hr@company.com'
+    })
+    return jsonify({'status': 'success', 'job': public_job(job), 'neo4j_pending': pending}), 201
+
+
+@app.route('/jobs/<job_id>', methods=['DELETE', 'OPTIONS'])
+def delete_job(job_id):
+    if request.method == 'OPTIONS': return '', 204
+    user = get_current_user()
+    if not user: return jsonify({'error': 'Unauthorized'}), 401
+    if job_id.startswith('legacy-'):
+        from bson import ObjectId
+        try:
+            queue_id, index_text = job_id[7:].rsplit('-', 1)
+            index = int(index_text)
+            queued = mongo_db['pending_neo4j_queue'].find_one({'_id': ObjectId(queue_id), 'type': 'job'})
+        except (ValueError, TypeError):
+            queued = None
+        if not queued or index < 0 or index >= len(queued.get('records', [])):
+            return jsonify({'error': 'Job not found.'}), 404
+        record = queued['records'].pop(index)
+        if queued['records']:
+            mongo_db['pending_neo4j_queue'].update_one({'_id': queued['_id']}, {'$set': {'records': queued['records']}})
+        else:
+            mongo_db['pending_neo4j_queue'].delete_one({'_id': queued['_id']})
+        role, client = record.get('job_role', ''), record.get('client_name', '')
+        pending = False
+    else:
+        job = mongo_db['jobs'].find_one({'id': job_id})
+        if not job: return jsonify({'error': 'Job not found.'}), 404
+        role, client = job['role'], job['client']
+        # A tombstone prevents an offline graph node from returning after deletion.
+        mongo_db['pending_neo4j_queue'].update_one(
+            {'type': 'job_delete', 'job_id': job_id},
+            {'$set': {'type': 'job_delete', 'job_id': job_id}}, upsert=True)
+        mongo_db['jobs'].delete_one({'id': job_id})
+        pending = True
+        try:
+            delete_job_from_graph(job_id)
+            mongo_db['pending_neo4j_queue'].delete_many({'type': 'job_delete', 'job_id': job_id})
+            pending = False
+        except Exception as error:
+            app.logger.warning('Job graph deletion pending: %s', type(error).__name__)
+    mongo_db['alerts'].insert_one({
+        'id': f"JOB-{uuid.uuid4().hex[:8]}", 'type': 'JOB_DELETED',
+        'employee': role, 'job_description': role, 'company_name': client,
+        'neo4j_pending': pending,
+        'sent_at': datetime.now(timezone.utc).isoformat(),
+        'recipient': 'hr@company.com'
+    })
+    return jsonify({'status': 'success', 'neo4j_pending': pending})
 
 @app.route('/alerts', methods=['GET'])
 def get_alerts():
@@ -929,6 +1003,8 @@ def expand_node(node):
     records = [rec for batch in employee_record_batches() for rec in batch['records']]
     canonical = {rec['emp_name']: rec for rec in records if rec.get('sync_version')}
     canonical_ids = {rec['id']: rec for rec in canonical.values()}
+    legacy_ids = {rec.get('id') or rec['emp_name']: rec for rec in records
+                  if not rec.get('sync_version') and rec.get('emp_name')}
     managed = set(canonical) | set(canonical_ids)
     imported_relations = {'WORKED_FOR', 'HAS_SKILL', 'HAS_MISC_SKILL',
                           'HAS_DOMAIN', 'HAS_LOCATION', 'HAS_LEVEL', 'WORKS_ON'}
@@ -965,6 +1041,13 @@ def expand_node(node):
         if entry.get('type') == 'Employee' and employee:
             entry.update(public_employee(employee))
             entry.update(label=employee['emp_name'], type='Employee')
+        elif entry.get('type') == 'Employee' and entry['id'] in legacy_ids:
+            legacy = legacy_ids[entry['id']]
+            entry.update(status=legacy.get('status') or 'AVAILABLE',
+                         deployment_status=effective_deployment_status(legacy),
+                         client_name=normalize_client_name(legacy.get('client_name')),
+                         softblock_job=legacy.get('softblock_job'),
+                         softblock_company=legacy.get('softblock_company'))
     connected = {node}
     for link in links:
         connected.update((link['source'], link['target']))
@@ -985,6 +1068,24 @@ def normalize_optional_text(value):
     if text.lower() in ('', 'na', 'n/a', 'none', 'null', 'nan'):
         return None
     return text
+
+def normalize_client_name(value):
+    name = normalize_optional_text(value)
+    return None if name and name.lower() in ('no client', 'no clients') else name
+
+def effective_deployment_status(record):
+    if (str(record.get('status') or '').upper() == 'SOFTBLOCKED'
+            and not record.get('sync_version')):
+        return 'SOFTBLOCKED'
+    explicit = normalize_optional_text(record.get('deployment_status'))
+    if explicit:
+        return explicit.upper()
+    if str(record.get('status') or '').upper() == 'SOFTBLOCKED':
+        return 'SOFTBLOCKED'
+    if not normalize_client_name(record.get('client_name')):
+        return 'AVAILABLE'
+    status = normalize_optional_text(record.get('status'))
+    return status.upper() if status else None
 
 def get_ingested_value(row, aliases):
     columns = {re.sub(r'[^a-z0-9]', '', str(column).lower()): column for column in row.index}
@@ -1045,10 +1146,12 @@ def upload_file():
         else:
             emp_available_since = today
         
+        client_name = normalize_client_name(get_ingested_value(row, ['Client_Name']))
+        deployment_status = normalize_optional_text(get_ingested_value(row, ['Deployment_Status']))
         rec = {
             'emp_name': ename,
-            'client_name': normalize_optional_text(get_ingested_value(row, ['Client_Name'])),
-            'deployment_status': (normalize_optional_text(get_ingested_value(row, ['Deployment_Status'])) or '').upper() or None,
+            'client_name': client_name,
+            'deployment_status': deployment_status.upper() if deployment_status else ('AVAILABLE' if client_name is None else None),
             'current_project': normalize_optional_text(get_ingested_value(row, ['Current_Project', 'Current_Projects', 'Project', 'Projects'])),
             'performance': normalize_optional_text(get_ingested_value(row, ['Performance'])),
             'skills': parse_skills(row.get('Skills')),
@@ -1133,13 +1236,26 @@ def sync_pending_neo4j():
     if not user: return jsonify({'error': 'Unauthorized'}), 401
     repair_softblocked_deployment_status(mongo_db)
     # Migrate old queued imports only when a permanent employee does not exist.
-    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$ne': 'job'}}):
+    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$nin': ['job', 'job_delete']}}):
         for rec in job.get('records', []):
             if rec.get('emp_name') and not find_employee(mongo_db, rec['emp_name']):
                 save_import(mongo_db, [rec], job.get('owner'), job.get('id'))
     pending = list(mongo_db['employees'].find({'neo4j_synced': False}))
     if not sync_employees(mongo_db, get_neo4j_driver, NEO4J_DATABASE, pending):
         return jsonify({'error': 'Knowledge graph unavailable; changes remain saved in MongoDB'}), 503
+    jobs_synced = 0
+    jobs_deleted = 0
+    try:
+        for deletion in mongo_db['pending_neo4j_queue'].find({'type': 'job_delete'}):
+            delete_job_from_graph(deletion['job_id'])
+            mongo_db['pending_neo4j_queue'].delete_one({'_id': deletion['_id']})
+            jobs_deleted += 1
+        for job in mongo_db['jobs'].find({'neo4j_synced': False}):
+            sync_job_to_graph(job)
+            mongo_db['jobs'].update_one({'id': job['id']}, {'$set': {'neo4j_synced': True}})
+            jobs_synced += 1
+    except Exception:
+        return jsonify({'error': 'Job graph sync is pending; changes remain saved in MongoDB'}), 503
     # Mark each upload by its employees, including repeated filenames.
     for upload in mongo_db['upload_history'].find({}):
         names = upload.get('employee_names')
@@ -1148,7 +1264,7 @@ def sync_pending_neo4j():
                 'emp_name': {'$in': names}, 'neo4j_synced': False,
             })
             mongo_db['upload_history'].update_one({'_id': upload['_id']}, {'$set': {'neo4j_synced': remaining == 0}})
-    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$ne': 'job'}}):
+    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$nin': ['job', 'job_delete']}}):
         names = [rec['emp_name'] for rec in job.get('records', []) if rec.get('emp_name')]
         if not mongo_db['employees'].count_documents({'emp_name': {'$in': names}, 'neo4j_synced': False}):
             mongo_db['pending_neo4j_queue'].delete_one({'_id': job['_id']})
@@ -1156,7 +1272,8 @@ def sync_pending_neo4j():
                 {'user_id': job.get('user_id'), 'filename': job.get('filename'), 'id': {'$exists': False}},
                 {'$set': {'neo4j_synced': True}},
             )
-    return jsonify({'synced': len(pending), 'message': f'Synced {len(pending)} employees to Neo4j'})
+    return jsonify({'synced': len(pending), 'jobs_synced': jobs_synced, 'jobs_deleted': jobs_deleted,
+                    'message': f'Synced {len(pending)} employees and {jobs_synced} jobs to Neo4j'})
 
 @app.route('/ingestion/clear', methods=['POST', 'OPTIONS'])
 def clear_database():

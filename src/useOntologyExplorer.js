@@ -23,9 +23,25 @@ export function useOntologyExplorer(initialFilters = {}) {
   const [isLoading, setIsLoading] = useState(false);
   const [selectedNode, setSelectedNode] = useState(null);
   const [filters, setFilters] = useState(initialFilters);
+  const searchRequestId = useRef(0);
+  const graphEpoch = useRef(0);
+
+  const clearExplorer = useCallback(() => {
+    searchRequestId.current++;
+    graphEpoch.current++;
+    setSearchQuery('');
+    setSearchResults([]);
+    setPendingGraphRoot(null);
+    setGraph({ nodes: [], links: [] });
+    setRootNode(null);
+    setExpandedIds(new Set());
+    setSelectedNode(null);
+    setIsLoading(false);
+  }, []);
 
   // Debounced search watcher
   useEffect(() => {
+    const requestId = ++searchRequestId.current;
     if (!searchQuery.trim()) {
       setSearchResults([]);
       setPendingGraphRoot(null);
@@ -33,14 +49,14 @@ export function useOntologyExplorer(initialFilters = {}) {
     }
 
     const timer = setTimeout(() => {
-      handleSearch(searchQuery.trim());
+      handleSearch(searchQuery.trim(), requestId);
     }, 300);
 
     return () => clearTimeout(timer);
   }, [searchQuery, filters]);
 
   // Step 1: Search nodes
-  const handleSearch = useCallback(async (query) => {
+  const handleSearch = useCallback(async (query, requestId) => {
     if (!query) return;
     setIsLoading(true);
     try {
@@ -48,6 +64,7 @@ export function useOntologyExplorer(initialFilters = {}) {
         credentials: 'include',
       });
       const results = (await parseJsonSafe(res)) || [];
+      if (requestId !== searchRequestId.current) return;
       setSearchResults(results);
       if (results.length > 0) {
         setPendingGraphRoot(results[0].id);
@@ -55,11 +72,12 @@ export function useOntologyExplorer(initialFilters = {}) {
         setPendingGraphRoot(null);
       }
     } catch (err) {
+      if (requestId !== searchRequestId.current) return;
       console.error('Search failed:', err);
       setSearchResults([]);
       setPendingGraphRoot(null);
     } finally {
-      setIsLoading(false);
+      if (requestId === searchRequestId.current) setIsLoading(false);
     }
   }, []);
 
@@ -107,6 +125,7 @@ export function useOntologyExplorer(initialFilters = {}) {
   const generateKnowledgeGraph = useCallback(async () => {
     if (!pendingGraphRoot) return;
     const targetRoot = pendingGraphRoot;
+    const epoch = graphEpoch.current;
 
     // Clear search results and pending root
     setSearchResults([]);
@@ -121,6 +140,7 @@ export function useOntologyExplorer(initialFilters = {}) {
         credentials: 'include',
       });
       const data = await parseJsonSafe(res);
+      if (epoch !== graphEpoch.current) return;
 
       if (data && data.nodes && data.nodes.length > 0) {
         setGraph(data);
@@ -134,6 +154,7 @@ export function useOntologyExplorer(initialFilters = {}) {
         setExpandedIds(new Set([targetRoot]));
       }
     } catch (err) {
+      if (epoch !== graphEpoch.current) return;
       console.error('Failed to generate graph:', err);
       setGraph({
         nodes: [{ id: targetRoot, label: targetRoot, type: 'Employee' }],
@@ -141,13 +162,14 @@ export function useOntologyExplorer(initialFilters = {}) {
       });
       setExpandedIds(new Set([targetRoot]));
     } finally {
-      setIsLoading(false);
+      if (epoch === graphEpoch.current) setIsLoading(false);
     }
   }, [pendingGraphRoot]);
 
   // Load a graph directly (e.g. from filter selection)
   const loadGraph = useCallback(async (rootId) => {
     if (!rootId) return;
+    const epoch = graphEpoch.current;
     setRootNode(rootId);
     setSelectedNode(null);
     setSearchResults([]);
@@ -159,6 +181,7 @@ export function useOntologyExplorer(initialFilters = {}) {
         credentials: 'include',
       });
       const data = await parseJsonSafe(res);
+      if (epoch !== graphEpoch.current) return;
 
       if (data && data.nodes && data.nodes.length > 0) {
         setGraph(data);
@@ -171,9 +194,10 @@ export function useOntologyExplorer(initialFilters = {}) {
         setExpandedIds(new Set([rootId]));
       }
     } catch (err) {
+      if (epoch !== graphEpoch.current) return;
       console.error('Failed to load graph:', err);
     } finally {
-      setIsLoading(false);
+      if (epoch === graphEpoch.current) setIsLoading(false);
     }
   }, []);
 
@@ -181,6 +205,7 @@ export function useOntologyExplorer(initialFilters = {}) {
   const expandNodeInGraph = useCallback(async (node) => {
     const nodeId = typeof node === 'object' ? node.id : node;
     if (!nodeId) return;
+    const epoch = graphEpoch.current;
 
     setIsLoading(true);
     try {
@@ -188,6 +213,7 @@ export function useOntologyExplorer(initialFilters = {}) {
         credentials: 'include',
       });
       const data = await parseJsonSafe(res);
+      if (epoch !== graphEpoch.current) return;
 
       if (data && (data.nodes || data.links)) {
         setGraph((prev) => mergeGraphs(prev, data.nodes || [], data.links || []));
@@ -198,9 +224,10 @@ export function useOntologyExplorer(initialFilters = {}) {
         });
       }
     } catch (err) {
+      if (epoch !== graphEpoch.current) return;
       console.error('Expand node error:', err);
     } finally {
-      setIsLoading(false);
+      if (epoch === graphEpoch.current) setIsLoading(false);
     }
   }, [mergeGraphs]);
 
@@ -306,5 +333,6 @@ export function useOntologyExplorer(initialFilters = {}) {
     setSelectedNode,
     filters,
     setFilters,
+    clearExplorer,
   };
 }

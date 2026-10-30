@@ -536,30 +536,54 @@ function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
 function Jobs({ jobs, setJobs, employees }) {
   const [showAdd, setShowAdd] = useState(false);
   const [selected, setSelected] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [jobError, setJobError] = useState("");
   const [form, setForm] = useState({ role:"", client:"", location:"", description:"", skills:"" });
   async function addJob() {
+    if (busy) return;
+    setJobError("");
     const j = {
-      id: "J" + String(Date.now()).slice(-4), role: form.role, client: form.client,
-      location: form.location, status: "OPEN", open_date: new Date().toISOString().split("T")[0],
-      description: form.description,
+      role: form.role.trim(), client: form.client.trim(),
+      location: form.location.trim(), description: form.description,
       required_skills: form.skills.split(",").map(s => { const [name, min_proficiency] = s.trim().split(":"); return { name: name?.trim(), min_proficiency: parseInt(min_proficiency) || 3 }; }).filter(s => s.name),
     };
-    
-    // Save to backend so it registers Client nodes in Neo4j
+    if (!j.role) { setJobError("Enter a role title."); return; }
+    setBusy(true);
     try {
-      await fetch(`${API_BASE}/jobs`, {
+      const response = await fetch(`${API_BASE}/jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify(j)
       });
+      const data = await parseJsonSafe(response);
+      if (!response.ok || !data?.job) throw new Error(data?.error || "Could not save the job.");
+      setJobs(prev => prev.some(item => item.id === data.job.id) ? prev : [...prev, data.job]);
+      setShowAdd(false);
+      setForm({ role:"", client:"", location:"", description:"", skills:"" });
     } catch(e) {
-      console.error("Failed to save job to backend", e);
+      setJobError(e.message || "Could not save the job.");
+    } finally {
+      setBusy(false);
     }
-
-    setJobs(prev => [...prev, j]);
-    setShowAdd(false);
-    setForm({ role:"", client:"", location:"", description:"", skills:"" });
+  }
+  async function deleteJob(job) {
+    if (busy || !window.confirm(`Delete ${job.role}${job.client ? ` at ${job.client}` : ""}?`)) return;
+    setBusy(true);
+    setJobError("");
+    try {
+      const response = await fetch(`${API_BASE}/jobs/${encodeURIComponent(job.id)}`, {
+        method: 'DELETE', credentials: 'include',
+      });
+      const data = await parseJsonSafe(response);
+      if (!response.ok) throw new Error(data?.error || "Could not delete the job.");
+      setJobs(prev => prev.filter(item => item.id !== job.id));
+      if (selected?.id === job.id) setSelected(null);
+    } catch(e) {
+      setJobError(e.message || "Could not delete the job.");
+    } finally {
+      setBusy(false);
+    }
   }
   return (
     <div>
@@ -568,9 +592,10 @@ function Jobs({ jobs, setJobs, employees }) {
         <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New job</button>
       </div>
       <div className="card">
+        {jobError && <div role="alert" style={{ color:T.red, padding:"12px 16px" }}>{jobError}</div>}
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Role</th><th>Client</th><th>Location</th><th>Required skills</th><th>Opened</th><th>Status</th></tr></thead>
+            <thead><tr><th>Role</th><th>Client</th><th>Location</th><th>Required skills</th><th>Opened</th><th>Status</th><th>Actions</th></tr></thead>
             <tbody>
               {jobs.map(j => (
                 <tr key={j.id} style={{ cursor:"pointer" }} onClick={() => setSelected(j)}>
@@ -580,6 +605,7 @@ function Jobs({ jobs, setJobs, employees }) {
                   <td><div className="skill-chips">{j.required_skills.map(s => <span key={s.name} className="skill-chip">{s.name} L{s.min_proficiency}+</span>)}</div></td>
                   <td style={{ color:T.muted }}>{j.open_date}</td>
                   <td><span className={`badge-status badge-${j.status?.toLowerCase()}`}>{j.status}</span></td>
+                  <td><button className="btn btn-ghost btn-sm" style={{ color:T.red }} disabled={busy} onClick={event => { event.stopPropagation(); deleteJob(j); }}>Delete</button></td>
                 </tr>
               ))}
             </tbody>
@@ -596,7 +622,8 @@ function Jobs({ jobs, setJobs, employees }) {
             ))}
             <div className="form-group"><label className="form-label">Description</label><textarea className="form-textarea" value={form.description} onChange={e => setForm(f=>({...f,description:e.target.value}))} placeholder="Describe the role and requirements..." /></div>
             <div className="form-group"><label className="form-label">Required skills (name:min-level, comma separated)</label><input className="form-input" value={form.skills} onChange={e => setForm(f=>({...f,skills:e.target.value}))} placeholder="React:4, TypeScript:3, Node.js:3" /></div>
-            <div className="modal-actions"><button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button><button className="btn btn-primary" onClick={addJob}>Create job</button></div>
+            {jobError && <div role="alert" style={{ color:T.red, marginBottom:8 }}>{jobError}</div>}
+            <div className="modal-actions"><button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button><button className="btn btn-primary" disabled={busy} onClick={addJob}>{busy ? "Saving..." : "Create job"}</button></div>
           </div>
         </div>
       )}
@@ -751,6 +778,8 @@ function Alerts({ employees, alerts, onUnblock, onSnooze }) {
                         ? <span className="badge-status badge-mapped">↑ Ingested</span>
                         : a.type === "JOB_CREATED"
                         ? <span className="badge-status badge-mapped">+ Job</span>
+                        : a.type === "JOB_DELETED"
+                        ? <span className="badge-status badge-rejected">− Job deleted</span>
                         : <span className={`badge-status ${a.threshold >= 45 ? "badge-rejected" : "badge-softblock"}`}>Day {a.threshold}</span>}
                     </td>
                     <td style={{ fontWeight:600, color: a.type==="SOFTBLOCK" ? T.amber : a.type==="RELEASE" ? T.green : a.type==="SOFTBLOCK_EXPIRY" ? T.red : (a.bench_age>=45?T.red:T.amber) }}>
@@ -769,6 +798,8 @@ function Alerts({ employees, alerts, onUnblock, onSnooze }) {
                         <>{a.rows_processed} employees from {a.filename}{a.neo4j_pending ? " · graph sync pending" : ""}</>
                       ) : a.type === "JOB_CREATED" ? (
                         <>{a.job_description}{a.company_name ? ` @ ${a.company_name}` : ""}{a.neo4j_pending ? " · graph sync pending" : ""}</>
+                      ) : a.type === "JOB_DELETED" ? (
+                        <>{a.job_description}{a.company_name ? ` @ ${a.company_name}` : ""} removed{a.neo4j_pending ? " · graph sync pending" : ""}</>
                       ) : a.type === "SOFTBLOCK_EXPIRY" ? (
                         <div>
                           <div>{a.job_description} <span style={{ fontWeight:400, color:T.muted }}>· blocked by {a.softblocked_by} · period ended {a.expiry_date}</span></div>
@@ -1425,9 +1456,11 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
     selectedNode,
     setSelectedNode,
     setFilters,
+    clearExplorer,
   } = useOntologyExplorer();
 
   const graphRef = useRef(null);
+  const filterRequestId = useRef(0);
   const [sbForm, setSbForm] = useState({ company_name: '', job_position: '' });
   const [showSoftblockForm, setShowSoftblockForm] = useState(false);
   const [graphActionLoading, setGraphActionLoading] = useState(false);
@@ -1481,31 +1514,30 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
     }
   }
 
-  async function handleFilterChange(filters, benchRange) {
+  async function handleFilterChange(filters, benchRange, clearSearch = false) {
+    const requestId = ++filterRequestId.current;
     setFilters({ ...filters, ...benchRange });
     const params = new URLSearchParams();
     if (benchRange.min > 0) params.append('benchMin', benchRange.min);
     if (benchRange.max < 365) params.append('benchMax', benchRange.max);
-    if (filters.client && filters.client !== '__ALL_CLIENTS__') params.append('client', filters.client);
+    if (filters.client) params.append('client', filters.client);
     if (filters.level) params.append('level', filters.level);
     if (filters.status) params.append('status', filters.status);
     if (filters.skills && filters.skills.length > 0) params.append('skills', filters.skills.join(','));
 
     // Check if any filter is actually active
     const hasFilter = [...params.keys()].some(k => !['benchMin','benchMax'].includes(k)) || params.has('benchMin') || params.has('benchMax');
-    if (!hasFilter || ((filters.client === "" || filters.client === '__ALL_CLIENTS__') && filters.status === "" && filters.level === "" && filters.skills.length === 0 && benchRange.min === 0 && benchRange.max === 365)) {
+    if (clearSearch || !hasFilter) {
       // No filters active – clear filter results and reset the graph
-      setSearchResults([]);
-      setPendingGraphRoot(null);
-      setGraph({ nodes: [], links: [] });
-      setSelectedNode(null);
+      clearExplorer();
       return;
     }
 
     try {
       const res = await fetch(`${API_BASE}/employees?${params.toString()}`, { credentials: "include" });
-      if (!res.ok) return;
+      if (!res.ok || requestId !== filterRequestId.current) return;
       const employees = (await parseJsonSafe(res)) || [];
+      if (requestId !== filterRequestId.current) return;
       // Map employees into search-result cards (same shape as /search)
       const results = employees.slice(0, 20).map(e => ({
         id: e.name || e.id,
@@ -1840,6 +1872,7 @@ export default function TalentLens() {
     try {
       await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "include" });
       setUser(null);
+      setJobs([]);
       setAlerts([]);
       knownAlertIds.current = null;
       setNewAlertToast(null);
@@ -1864,7 +1897,7 @@ export default function TalentLens() {
     alerts.forEach(a => { if (a.id) knownAlertIds.current.add(a.id); });
     if (incoming.length) {
       const latest = incoming[incoming.length - 1];
-      const action = latest.type === "SOFTBLOCK" ? "soft-blocked" : latest.type === "RELEASE" ? "released" : latest.type === "SNOOZE" ? "snoozed" : latest.type === "INGESTION" ? "ingested" : latest.type === "JOB_CREATED" ? "created" : "has a new alert";
+      const action = latest.type === "SOFTBLOCK" ? "soft-blocked" : latest.type === "RELEASE" ? "released" : latest.type === "SNOOZE" ? "snoozed" : latest.type === "INGESTION" ? "ingested" : latest.type === "JOB_CREATED" ? "created" : latest.type === "JOB_DELETED" ? "deleted" : "has a new alert";
       setNewAlertToast(incoming.length === 1 ? `${latest.employee} ${action}` : `${incoming.length} new alerts and employee changes`);
     }
   }, [alerts]);
@@ -1889,6 +1922,11 @@ export default function TalentLens() {
         .then(data => {
           if (Array.isArray(data)) setEmployees(data);
         })
+        .catch(console.error);
+
+      fetch(`${API_BASE}/jobs`, { credentials: "include" })
+        .then(res => parseJsonSafe(res))
+        .then(data => { if (Array.isArray(data)) setJobs(data); })
         .catch(console.error);
         
       fetch(`${API_BASE}/alerts`, { credentials: "include" })
@@ -1952,6 +1990,13 @@ export default function TalentLens() {
           }
         }
       } catch (err) { /* backend not reachable yet, ignore */ }
+      try {
+        const jobsResponse = await fetch(`${API_BASE}/jobs`, { credentials: "include" });
+        if (jobsResponse.ok) {
+          const savedJobs = await parseJsonSafe(jobsResponse);
+          if (!cancelled && Array.isArray(savedJobs)) setJobs(savedJobs);
+        }
+      } catch (err) { /* keep the last loaded jobs while the backend is unavailable */ }
     }
     poll();
     const interval = setInterval(poll, 8000);

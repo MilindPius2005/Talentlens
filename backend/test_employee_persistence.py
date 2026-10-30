@@ -276,6 +276,44 @@ class EmployeePersistenceTests(unittest.TestCase):
                 self.assertEqual([employee['name'] for employee in response.json], [f'Employee {index}'])
                 self.assertEqual(find_employee(self.db, f'Employee {index}')['deployment_status'], status.upper())
 
+    def test_excel_no_client_rows_map_to_available(self):
+        rows = api.pd.DataFrame([
+            {'Emp_Name': 'No Client Available', 'Client_Name': None, 'Skills': 'Python',
+             'misc skill': 'SQL', 'Deployment Status': 'AVAILABLE'},
+            {'Emp_Name': 'No Client Blank Status', 'Client_Name': 'No Clients', 'Skills': 'Java',
+             'misc skill': 'AWS', 'Deployment Status': None},
+        ])
+        file = BytesIO()
+        rows.to_excel(file, index=False, engine='openpyxl')
+        file.seek(0)
+        response = self.client.post('/ingestion/upload', data={'file': (file, 'no-clients.xlsx')})
+        self.assertEqual(response.status_code, 200)
+        for name in ('No Client Available', 'No Client Blank Status'):
+            with self.subTest(name=name):
+                employee = find_employee(self.db, name)
+                self.assertIsNone(employee['client_name'])
+                self.assertEqual(employee['deployment_status'], 'AVAILABLE')
+                self.assertEqual(employee['status'], 'AVAILABLE')
+        filtered = self.client.get('/employees?status=AVAILABLE&client=__NO_CLIENT__').json
+        self.assertEqual({employee['name'] for employee in filtered},
+                         {'No Client Available', 'No Client Blank Status'})
+
+    def test_legacy_no_client_queue_maps_to_available_and_migrates(self):
+        self.db.pending_neo4j_queue.insert_one({
+            'owner': 'Tester', 'records': [{'emp_name': 'Legacy No Client',
+                                          'client_name': None, 'skills': [],
+                                          'misc_skills': [], 'domain': [],
+                                          'location': [], 'level': []}],
+        })
+        filtered = self.client.get('/employees?status=AVAILABLE&client=__NO_CLIENT__').json
+        self.assertEqual([employee['name'] for employee in filtered], ['Legacy No Client'])
+        self.assertEqual(filtered[0]['deployment_status'], 'AVAILABLE')
+        self.assertIn('AVAILABLE', self.client.get('/filter-options').json['deploymentStatuses'])
+        expanded = self.client.get('/expand/Legacy No Client').json
+        self.assertEqual(next(node for node in expanded['nodes'] if node['id'] == 'Legacy No Client')['deployment_status'], 'AVAILABLE')
+        self.client.post('/ingestion/sync-pending')
+        self.assertEqual(find_employee(self.db, 'Legacy No Client')['deployment_status'], 'AVAILABLE')
+
     def test_edit_accepts_custom_deployment_status(self):
         self.upload()
         response = self.client.put('/employees/Alice', json={'deployment_status': 'On Leave'})
@@ -323,6 +361,47 @@ class EmployeePersistenceTests(unittest.TestCase):
         self.client.put('/employees/Alice', json={'deployment_status': 'Training'})
         self.assertEqual(self.client.get('/employees?status=TRAINING').json[0]['name'], 'Alice')
         self.assertEqual(self.client.get('/filter-options').json['deploymentStatuses'], ['TRAINING'])
+
+    def test_job_can_be_created_loaded_and_deleted(self):
+        created = self.client.post('/jobs', json={
+            'role': 'Engineer', 'client': 'Acme', 'location': 'London',
+            'required_skills': [{'name': 'Python', 'min_proficiency': 3}],
+        })
+        self.assertEqual(created.status_code, 201)
+        job_id = created.json['job']['id']
+        self.assertEqual([job['id'] for job in self.client.get('/jobs').json], [job_id])
+        self.assertEqual(self.db.jobs.find_one({'id': job_id})['role'], 'Engineer')
+        deleted = self.client.delete(f'/jobs/{job_id}')
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.client.get('/jobs').json, [])
+        self.assertIsNone(self.db.jobs.find_one({'id': job_id}))
+        self.assertEqual(self.db.alerts.find_one({'type': 'JOB_DELETED'})['job_description'], 'Engineer')
+        self.assertTrue(any('DETACH DELETE j' in call.args[0] for call in self.session.run.call_args_list))
+
+    def test_offline_job_delete_stays_deleted_and_graph_retry_clears_tombstone(self):
+        self.offline()
+        created = self.client.post('/jobs', json={'role': 'Analyst', 'client': 'Acme'})
+        job_id = created.json['job']['id']
+        self.assertTrue(created.json['neo4j_pending'])
+        self.assertEqual(self.db.jobs.find_one({'id': job_id})['neo4j_synced'], False)
+        deleted = self.client.delete(f'/jobs/{job_id}')
+        self.assertEqual(deleted.status_code, 200)
+        self.assertTrue(deleted.json['neo4j_pending'])
+        self.assertEqual(self.client.get('/jobs').json, [])
+        self.assertEqual(self.db.pending_neo4j_queue.count_documents({'type': 'job_delete'}), 1)
+        self.online()
+        self.assertEqual(self.client.post('/ingestion/sync-pending').status_code, 200)
+        self.assertEqual(self.db.pending_neo4j_queue.count_documents({'type': 'job_delete'}), 0)
+        self.assertEqual(self.client.get('/jobs').json, [])
+
+    def test_legacy_queued_job_is_deletable(self):
+        self.db.pending_neo4j_queue.insert_one({
+            'type': 'job', 'records': [{'job_role': 'Designer', 'client_name': 'Acme', 'location': 'Pune'}]
+        })
+        job = self.client.get('/jobs').json[0]
+        self.assertEqual(job['role'], 'Designer')
+        self.assertEqual(self.client.delete(f"/jobs/{job['id']}").status_code, 200)
+        self.assertEqual(self.db.pending_neo4j_queue.count_documents({'type': 'job'}), 0)
 
 
 if __name__ == '__main__':

@@ -34,6 +34,10 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
   }, [API_BASE]);
 
   const handleChange = (key, val) => {
+    if (key === 'client' && val === '') {
+      handleReset();
+      return;
+    }
     const newFilters = { ...filters, [key]: val };
     setFilters(newFilters);
     onFilterChange(newFilters, benchRange);
@@ -64,7 +68,7 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
     const defaultBench = { min: options.benchMin || 0, max: options.benchMax || 365 };
     setFilters(emptyFilters);
     setBenchRange(defaultBench);
-    onFilterChange(emptyFilters, defaultBench);
+    onFilterChange(emptyFilters, defaultBench, true);
   };
 
   return (
@@ -87,8 +91,7 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
       <div>
         <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Client Name</label>
         <select className="form-input" value={filters.client} onChange={e => handleChange('client', e.target.value)}>
-          <option value="" hidden></option>
-          <option value="__ALL_CLIENTS__">All Clients</option>
+          <option value="" aria-label="Clear client search"> </option>
           <option value="__NO_CLIENT__">No Clients</option>
           {options.clients.map(c => <option key={c} value={c}>{c}</option>)}
         </select>
