@@ -1,12 +1,23 @@
 import os
 import uuid
+import re
+from io import BytesIO
 import pandas as pd
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from neo4j import GraphDatabase
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from gridfs import GridFS
+
+if __package__:
+    from .employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
+                                 sync_employees, public_employee, repair_softblocked_deployment_status)
+else:
+    from employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
+                                sync_employees, public_employee, repair_softblocked_deployment_status)
 
 load_dotenv()
 
@@ -16,6 +27,13 @@ MONGO_URI = os.getenv('MONGO_URI')
 MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'talentlens')
 mongo_client = MongoClient(MONGO_URI)
 mongo_db = mongo_client[MONGO_DB_NAME]
+document_storage = GridFS(mongo_db)
+
+
+@app.errorhandler(PyMongoError)
+def mongo_storage_error(error):
+    app.logger.error('MongoDB operation failed: %s', type(error).__name__)
+    return jsonify({'error': 'MongoDB is unavailable; the operation could not be saved. Please retry.'}), 503
 
 NEO4J_URI = os.getenv('NEO4J_URI')
 NEO4J_USER = os.getenv('NEO4J_USER')
@@ -141,16 +159,34 @@ def auth_logout():
     resp.set_cookie('oe_session', '', expires=0)
     return resp
 
+def employee_record_batches():
+    """Read permanent records first, with compatibility for old queued uploads."""
+    repair_softblocked_deployment_status(mongo_db)
+    employees = list(mongo_db['employees'].find({}))
+    yield {'records': employees}
+    names = {employee['emp_name'] for employee in employees}
+    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$ne': 'job'}}):
+        records = [rec for rec in job.get('records', [])
+                   if rec.get('emp_name') and rec['emp_name'] not in names]
+        names.update(rec['emp_name'] for rec in records)
+        yield {**job, 'records': records}
+
+
 def get_pending_queue_data():
-    """Read all queued ingestion records from MongoDB and aggregate them by field type."""
-    result = {'skills': set(), 'clients': set(), 'locations': set(), 'domains': set(), 'levels': set(), 'employees': []}
+    """Aggregate current MongoDB employees and legacy queued imports."""
+    result = {'skills': set(), 'clients': set(), 'locations': set(), 'domains': set(), 'levels': set(), 'deployment_statuses': set(), 'employees': []}
     try:
-        for job in mongo_db['pending_neo4j_queue'].find({}, {'records': 1, 'today': 1}):
+        for job in employee_record_batches():
             for rec in job.get('records', []):
+                deployment_status = normalize_optional_text(rec.get('deployment_status')) or rec.get('status')
+                if not rec.get('sync_version') and rec.get('status') == 'SOFTBLOCKED':
+                    deployment_status = 'SOFTBLOCKED'
+                if deployment_status:
+                    result['deployment_statuses'].add(deployment_status.upper())
                 for sk in rec.get('skills', []) + rec.get('misc_skills', []):
                     if sk: result['skills'].add(sk)
                 cn = rec.get('client_name')
-                if cn and cn not in ('nan', '', 'None'): result['clients'].add(cn)
+                if normalize_optional_text(cn): result['clients'].add(cn)
                 
                 loc = rec.get('location')
                 if loc:
@@ -185,9 +221,10 @@ def get_filter_options():
     user = get_current_user()
     if not user:
         return jsonify({"error": "Unauthorized"}), 401
+    managed_names = [employee['emp_name'] for employee in mongo_db['employees'].find({}, {'emp_name': 1})]
     
     options = {
-        'clients': [], 'locations': [], 'domains': [], 'skills': [], 'levels': [],
+        'clients': [], 'locations': [], 'domains': [], 'skills': [], 'levels': [], 'deploymentStatuses': [],
         'benchMin': 0, 'benchMax': 0
     }
     try:
@@ -196,7 +233,23 @@ def get_filter_options():
                 res = session.run("MATCH (s:Skill) RETURN DISTINCT s.name as name")
                 options['skills'] = sorted([r['name'] for r in res if r['name']])
                 res = session.run("MATCH (c:Client) RETURN DISTINCT c.name as name")
-                options['clients'] = sorted([r['name'] for r in res if r['name']])
+                options['clients'] = sorted([
+                    r['name'] for r in res
+                    if r['name'] and normalize_optional_text(r['name'])
+                ])
+                res = session.run("""
+                    MATCH (e:Employee)
+                    WHERE NOT e.name IN $managed_names
+                    RETURN DISTINCT CASE WHEN toUpper(e.status) = 'SOFTBLOCKED'
+                        THEN 'SOFTBLOCKED' ELSE coalesce(
+                        e.deployment_status,
+                        e.status
+                    ) END as status
+                """, managed_names=managed_names)
+                options['deploymentStatuses'] = sorted([
+                    status.upper() for r in res
+                    if (status := normalize_optional_text(r['status']))
+                ])
                 res = session.run("MATCH (l:Location) RETURN DISTINCT l.name as name")
                 options['locations'] = sorted([r['name'] for r in res if r['name']])
                 res = session.run("MATCH (d:Domain) RETURN DISTINCT d.name as name")
@@ -217,6 +270,9 @@ def get_filter_options():
     pending = get_pending_queue_data()
     options['skills'] = sorted(set(options['skills']) | pending['skills'])
     options['clients'] = sorted(set(options['clients']) | pending['clients'])
+    options['deploymentStatuses'] = sorted(
+        set(options['deploymentStatuses']) | pending['deployment_statuses']
+    )
     options['locations'] = sorted(set(options['locations']) | pending['locations'])
     options['domains'] = sorted(set(options['domains']) | pending['domains'])
     options['levels'] = sorted(set(options['levels']) | pending['levels'])
@@ -244,7 +300,13 @@ def get_employees():
     where_clauses = []
     params = {}
     
-    if client:
+    if client == '__NO_CLIENT__':
+        where_clauses.append(
+            "coalesce(toLower(trim(toString(e.client_name))), '') IN ['', 'na', 'n/a', 'none', 'null', 'nan'] "
+            "AND NOT EXISTS { MATCH (e)-[:WORKED_FOR]->(c:Client) "
+            "WHERE toLower(trim(c.name)) NOT IN ['', 'na', 'n/a', 'none', 'null', 'nan'] }"
+        )
+    elif client:
         match_clauses.append("MATCH (e)-[:WORKED_FOR]->(:Client {name: $client})")
         params['client'] = client
     if location:
@@ -257,8 +319,13 @@ def get_employees():
         match_clauses.append("MATCH (e)-[:HAS_LEVEL]->(:Level {name: $level})")
         params['level'] = level
     if status:
-        where_clauses.append("e.status = $status")
-        params['status'] = status.upper()
+        normalized_status = status.strip().upper()
+        where_clauses.append("""
+            toUpper(trim(CASE WHEN toUpper(e.status) = 'SOFTBLOCKED'
+                THEN 'SOFTBLOCKED' ELSE coalesce(e.deployment_status, e.status)
+            END)) = $status
+        """)
+        params['status'] = normalized_status
     if search:
         where_clauses.append("toLower(e.name) CONTAINS toLower($search)")
         params['search'] = search
@@ -275,6 +342,8 @@ def get_employees():
     query += "\nRETURN e"
     
     employees = []
+    repair_softblocked_deployment_status(mongo_db)
+    canonical_names = {emp['emp_name'].lower() for emp in mongo_db['employees'].find({}, {'emp_name': 1})}
     seen_names = set()
     try:
         with get_neo4j_driver() as driver:
@@ -284,6 +353,8 @@ def get_employees():
                 for record in result:
                     node = record['e']
                     emp = dict(node)
+                    if emp.get('name', '').lower() in canonical_names:
+                        continue
                     
                     bench_days = 0
                     if emp.get('available_since'):
@@ -301,6 +372,10 @@ def get_employees():
                         'id': id_val,
                         'name': emp.get('name'),
                         'status': emp.get('status', 'AVAILABLE'),
+                        'deployment_status': 'SOFTBLOCKED' if emp.get('status') == 'SOFTBLOCKED' else emp.get('deployment_status'),
+                        'client_name': emp.get('client_name'),
+                        'current_project': emp.get('current_project'),
+                        'performance': emp.get('performance'),
                         'available_since': emp.get('available_since'),
                         'bench_aging': bench_days,
                         'location': emp.get('location'),
@@ -321,21 +396,24 @@ def get_employees():
         today_str = today.strftime('%Y-%m-%d')
         skill_filter = [s.strip() for s in skills.split(',')] if skills else []
 
-        for job in mongo_db['pending_neo4j_queue'].find({}, {'records': 1, 'today': 1}):
+        for job in employee_record_batches():
             for rec in job.get('records', []):
                 emp_name = rec.get('emp_name', '')
                 if not emp_name or emp_name.lower() in seen_names:
                     continue
 
                 all_skills = rec.get('skills', []) + rec.get('misc_skills', [])
-                if client and rec.get('client_name') != client: continue
+                rec_client = normalize_optional_text(rec.get('client_name'))
+                if client == '__NO_CLIENT__' and rec_client: continue
+                if client and client != '__NO_CLIENT__' and rec.get('client_name') != client: continue
                 if location and location not in rec.get('location', []): continue
                 if domain and domain not in rec.get('domain', []): continue
                 if level and level not in rec.get('level', []): continue
-                rec_status = rec.get('status', 'AVAILABLE')
-                if status and status.upper() != rec_status: continue
+                rec_status = ('SOFTBLOCKED' if not rec.get('sync_version') and rec.get('status') == 'SOFTBLOCKED' else
+                              (normalize_optional_text(rec.get('deployment_status')) or rec.get('status') or '')).upper()
+                if status and status.strip().upper() != rec_status: continue
                 if search and search.lower() not in emp_name.lower(): continue
-                if skill_filter and not any(sk in all_skills for sk in skill_filter): continue
+                if skill_filter and not all(sk in all_skills for sk in skill_filter): continue
 
                 avail_date_str = rec.get('available_since') or job.get('today', today_str)
                 bench_days = 0
@@ -348,10 +426,17 @@ def get_employees():
                 if bench_max is not None and bench_days > bench_max: continue
 
                 seen_names.add(emp_name.lower())
+                if rec.get('sync_version'):
+                    employees.append(public_employee(rec))
+                    continue
                 employees.append({
                     'id': emp_name,
                     'name': emp_name,
-                    'status': rec_status,
+                    'status': rec.get('status', 'AVAILABLE'),
+                    'deployment_status': rec.get('deployment_status'),
+                    'client_name': rec.get('client_name'),
+                    'current_project': rec.get('current_project'),
+                    'performance': rec.get('performance'),
                     'available_since': avail_date_str,
                     'bench_aging': bench_days,
                     'location': rec.get('location', [None])[0] if rec.get('location') else None,
@@ -369,7 +454,84 @@ def get_employees():
 
     return jsonify(employees)
 
-@app.route('/employees/<emp_id>/softblock', methods=['POST', 'OPTIONS'])
+def load_editable_employee(emp_id, user):
+    employee = find_employee(mongo_db, emp_id)
+    if employee:
+        return employee
+    # Bring employees from an older upload into permanent storage on first edit.
+    for batch in employee_record_batches():
+        for rec in batch['records']:
+            if emp_id in (rec.get('id'), rec.get('emp_name')):
+                save_import(mongo_db, [rec], user.get('name'), None)
+                return find_employee(mongo_db, rec['emp_name'])
+    with get_neo4j_driver() as driver:
+        with driver.session(database=NEO4J_DATABASE) as session:
+            row = session.run('''
+                MATCH (e:Employee) WHERE e.id = $id OR e.name = $id
+                OPTIONAL MATCH (e)-[r]->(n)
+                RETURN e, collect({relation: type(r), name: n.name}) AS related
+            ''', id=emp_id).single()
+            if not row:
+                return None
+            rec = dict(row['e'])
+            rec['emp_name'] = rec['name']
+            for key, relation in (('skills', 'HAS_SKILL'), ('misc_skills', 'HAS_MISC_SKILL'),
+                                  ('domain', 'HAS_DOMAIN'), ('location', 'HAS_LOCATION'), ('level', 'HAS_LEVEL')):
+                rec[key] = [item['name'] for item in row['related']
+                            if item['relation'] == relation and item['name']]
+            if not rec.get('client_name'):
+                rec['client_name'] = next((item['name'] for item in row['related']
+                                           if item['relation'] == 'WORKED_FOR'), None)
+            save_import(mongo_db, [rec], user.get('name'), None)
+            if rec.get('id'):
+                mongo_db['employees'].update_one({'emp_name': rec['emp_name']}, {'$set': {'id': rec['id']}})
+            return find_employee(mongo_db, rec['emp_name'])
+
+
+def persist_employee_change(emp_id, user, changes):
+    if not load_editable_employee(emp_id, user):
+        return None
+    employee = update_employee(mongo_db, emp_id, changes)
+    if not employee:
+        return None
+    sync_employees(mongo_db, get_neo4j_driver, NEO4J_DATABASE, [employee])
+    return find_employee(mongo_db, employee['id'])
+
+
+@app.route('/employees/<path:emp_id>', methods=['PUT', 'OPTIONS'])
+def edit_employee(emp_id):
+    if request.method == 'OPTIONS': return '', 204
+    user = get_current_user()
+    if not user: return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True)
+    allowed = {'deployment_status', 'client_name', 'current_project', 'performance',
+               'available_since', *LIST_FIELDS}
+    if not isinstance(data, dict) or not data or set(data) - allowed:
+        return jsonify({'error': 'Provide supported employee fields only'}), 400
+    changes = {}
+    for field, value in data.items():
+        if field in LIST_FIELDS:
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                return jsonify({'error': f'{field} must be a list of strings'}), 400
+            changes[field] = list(dict.fromkeys(item.strip() for item in value if item.strip()))
+        else:
+            if value is not None and not isinstance(value, str):
+                return jsonify({'error': f'{field} must be text or null'}), 400
+            changes[field] = normalize_optional_text(value)
+    if 'deployment_status' in changes:
+        changes['deployment_status'] = (changes['deployment_status'] or '').upper() or None
+    if changes.get('available_since'):
+        try:
+            datetime.strptime(changes['available_since'], '%Y-%m-%d')
+        except ValueError:
+            return jsonify({'error': 'available_since must be YYYY-MM-DD'}), 400
+    employee = persist_employee_change(emp_id, user, changes)
+    if not employee: return jsonify({'error': 'Employee not found'}), 404
+    return jsonify({'ok': True, 'employee': public_employee(employee),
+                    'neo4j_pending': not employee['neo4j_synced']})
+
+
+@app.route('/employees/<path:emp_id>/softblock', methods=['POST', 'OPTIONS'])
 def softblock_employee(emp_id):
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
@@ -384,34 +546,14 @@ def softblock_employee(emp_id):
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     expiry = (datetime.now(timezone.utc) + timedelta(days=SOFTBLOCK_DAYS)).strftime('%Y-%m-%d')
     
-    emp_name = emp_id
-    graph_updated = False
-    try:
-        with get_neo4j_driver() as driver:
-            with driver.session(database=NEO4J_DATABASE) as session:
-                res = session.run(
-                    "MATCH (e:Employee) WHERE e.name = $emp_id OR e.id = $emp_id SET e.status = 'SOFTBLOCKED', e.softblock_job = $job, e.softblock_company = $company, e.softblock_manager = $manager, e.softblock_start = $start, e.softblock_expiry = $expiry RETURN e.name AS name",
-                    emp_id=emp_id, job=job_label, company=company_name, manager=manager_name, start=today, expiry=expiry
-                )
-                rec = res.single()
-                if rec and rec['name']:
-                    emp_name = rec['name']
-                    graph_updated = True
-    except Exception as e:
-        print(f"Neo4j softblock error: {e}")
-
-    queue_updated = False
-    try:
-        result = mongo_db['pending_neo4j_queue'].update_many(
-            {"records.emp_name": emp_name},
-            {"$set": {"records.$.status": "SOFTBLOCKED", "records.$.softblock_job": job_label, "records.$.softblock_company": company_name, "records.$.softblock_manager": manager_name, "records.$.softblock_start": today, "records.$.softblock_expiry": expiry}}
-        )
-        queue_updated = result.matched_count > 0
-    except Exception:
-        pass
-
-    if not graph_updated and not queue_updated:
-        return jsonify({"error": "Employee was not found in the available database. No soft-block was saved."}), 503
+    employee = persist_employee_change(emp_id, user, {
+        'status': 'SOFTBLOCKED', 'deployment_status': 'SOFTBLOCKED', 'softblock_job': job_label,
+        'softblock_company': company_name,
+        'softblock_manager': manager_name, 'softblock_start': today,
+        'softblock_expiry': expiry,
+    })
+    if not employee: return jsonify({'error': 'Employee not found'}), 404
+    emp_name = employee['emp_name']
 
     alert_doc = {
         'id': f"SB-{uuid.uuid4().hex[:8]}",
@@ -426,49 +568,24 @@ def softblock_employee(emp_id):
         'recipient': 'hr@company.com'
     }
     mongo_db['alerts'].insert_one(alert_doc)
-    return jsonify({"ok": True, "status": "SOFTBLOCKED", "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
+    return jsonify({"ok": True, 'employee': public_employee(employee),
+                    'neo4j_pending': not employee['neo4j_synced'],
+                    "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
 
-@app.route('/employees/<emp_id>/release', methods=['POST', 'OPTIONS'])
+@app.route('/employees/<path:emp_id>/release', methods=['POST', 'OPTIONS'])
 def release_employee(emp_id):
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
     if not user: return jsonify({"error": "Unauthorized"}), 401
-    today = datetime.now(timezone.utc).isoformat()
-    emp_name = emp_id
-    released_from = 'Previous Opportunity'
-    try:
-        queued = mongo_db['pending_neo4j_queue'].find_one(
-            {'records.emp_name': emp_id}, {'records.$': 1})
-        if queued and queued.get('records'):
-            released_from = queued['records'][0].get('softblock_job') or released_from
-    except Exception:
-        pass
-    graph_updated = False
-    try:
-        with get_neo4j_driver() as driver:
-            with driver.session(database=NEO4J_DATABASE) as session:
-                res = session.run("MATCH (e:Employee) WHERE e.name = $emp_id OR e.id = $emp_id RETURN e.name AS name, e.softblock_job AS job", emp_id=emp_id)
-                rec = res.single()
-                if rec:
-                    if rec.get('name'): emp_name = rec['name']
-                    if rec.get('job'): released_from = rec['job']
-                result = session.run("MATCH (e:Employee) WHERE e.name = $emp_id OR e.id = $emp_id SET e.status = 'AVAILABLE', e.softblock_job = null, e.softblock_company = null, e.softblock_manager = null, e.softblock_start = null, e.softblock_expiry = null RETURN e.name AS name", emp_id=emp_id)
-                graph_updated = result.single() is not None
-    except Exception as e:
-        print(f"Neo4j release error: {e}")
-
-    queue_updated = False
-    try:
-        result = mongo_db['pending_neo4j_queue'].update_many(
-            {"records.emp_name": emp_name},
-            {"$set": {"records.$.status": "AVAILABLE", "records.$.softblock_job": None, "records.$.softblock_company": None, "records.$.softblock_manager": None, "records.$.softblock_start": None, "records.$.softblock_expiry": None}}
-        )
-        queue_updated = result.matched_count > 0
-    except Exception:
-        pass
-
-    if not graph_updated and not queue_updated:
-        return jsonify({"error": "Employee was not found in the available database. No release was saved."}), 503
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    previous = load_editable_employee(emp_id, user)
+    if not previous: return jsonify({'error': 'Employee not found'}), 404
+    released_from = previous.get('softblock_job') or 'Previous Opportunity'
+    employee = persist_employee_change(emp_id, user, {
+        'status': 'AVAILABLE', 'deployment_status': 'AVAILABLE', 'softblock_job': None, 'softblock_manager': None,
+        'softblock_company': None, 'softblock_start': None, 'softblock_expiry': None,
+    })
+    emp_name = employee['emp_name']
 
     alert_doc = {
         'id': f"REL-{uuid.uuid4().hex[:8]}",
@@ -480,41 +597,32 @@ def release_employee(emp_id):
         'recipient': 'hr@company.com'
     }
     mongo_db['alerts'].insert_one(alert_doc)
-    return jsonify({"ok": True, "status": "AVAILABLE", "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
+    return jsonify({"ok": True, 'employee': public_employee(employee),
+                    'neo4j_pending': not employee['neo4j_synced'],
+                    "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
 
-@app.route('/employees/<emp_id>/snooze', methods=['POST', 'OPTIONS'])
+@app.route('/employees/<path:emp_id>/snooze', methods=['POST', 'OPTIONS'])
 def snooze_employee(emp_id):
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
     if not user: return jsonify({"error": "Unauthorized"}), 401
     expiry = (datetime.now(timezone.utc) + timedelta(days=SOFTBLOCK_DAYS)).strftime('%Y-%m-%d')
-    graph_updated = False
-    try:
-        with get_neo4j_driver() as driver:
-            with driver.session(database=NEO4J_DATABASE) as session:
-                result = session.run("MATCH (e:Employee) WHERE (e.name = $emp_id OR e.id = $emp_id) AND e.status = 'SOFTBLOCKED' SET e.softblock_expiry = $expiry RETURN e.name AS name", emp_id=emp_id, expiry=expiry)
-                graph_updated = result.single() is not None
-    except Exception as e:
-        print(f"Neo4j snooze error: {e}")
-    queue_updated = False
-    try:
-        result = mongo_db['pending_neo4j_queue'].update_many(
-            {"records": {"$elemMatch": {"emp_name": emp_id, "status": "SOFTBLOCKED"}}},
-            {"$set": {"records.$.softblock_expiry": expiry}}
-        )
-        queue_updated = result.matched_count > 0
-    except Exception as e:
-        print(f"Queue snooze error: {e}")
-    if not graph_updated and not queue_updated:
-        return jsonify({"error": "Soft-blocked employee was not found. No reminder was snoozed."}), 404
+    previous = load_editable_employee(emp_id, user)
+    if not previous or previous.get('status') != 'SOFTBLOCKED':
+        return jsonify({'error': 'Soft-blocked employee was not found. No reminder was snoozed.'}), 404
+    employee = persist_employee_change(emp_id, user, {'softblock_expiry': expiry})
+    if not employee: return jsonify({'error': 'Employee not found'}), 404
     alert_doc = {
         'id': f"SNZ-{uuid.uuid4().hex[:8]}", 'type': 'SNOOZE',
-        'employee': emp_id, 'employee_id': emp_id, 'expiry_date': expiry,
-        'sent_at': datetime.now(timezone.utc).isoformat(),
+        'employee': employee['emp_name'], 'employee_id': employee['id'],
+        'expiry_date': expiry, 'sent_at': datetime.now(timezone.utc).isoformat(),
         'recipient': 'hr@company.com'
     }
     mongo_db['alerts'].insert_one(alert_doc)
-    return jsonify({"ok": True, "expiry_date": expiry, "alert": {k: v for k, v in alert_doc.items() if k != '_id'}})
+    return jsonify({'ok': True, 'employee': public_employee(employee),
+                    'neo4j_pending': not employee['neo4j_synced'],
+                    'expiry_date': expiry,
+                    'alert': {k: v for k, v in alert_doc.items() if k != '_id'}})
 
 @app.route('/jobs', methods=['POST', 'OPTIONS'])
 def add_job():
@@ -639,7 +747,7 @@ def get_alerts():
     # Include pending employees in automatic bench reminders and active soft-blocks.
     try:
         pending_seen = set()
-        for job in mongo_db['pending_neo4j_queue'].find({}, {'records': 1, 'today': 1}):
+        for job in employee_record_batches():
             for rec in job.get('records', []):
                 emp_name = rec.get('emp_name')
                 if not emp_name or emp_name.lower() in pending_seen:
@@ -768,7 +876,7 @@ def search_ontology():
     # Also search pending MongoDB queue (ingested but Neo4j offline)
     low_q = q.lower()
     try:
-        for job in mongo_db['pending_neo4j_queue'].find({}, {'records': 1}):
+        for job in employee_record_batches():
             for rec in job.get('records', []):
                 name = rec.get('emp_name', '')
                 if name and low_q in name.lower() and name not in seen:
@@ -817,90 +925,74 @@ def expand_node(node):
     except Exception as e:
         print(f"Expand Neo4j error: {e}")
 
-    # Fallback to pending MongoDB queue if still no nodes (ingested but Neo4j offline)
-    if not nodes:
-        try:
-            node_lower = node.lower()
-            def add_n(n_id, n_type, rec=None):
-                if not any(n['id'] == n_id for n in nodes):
-                    item = {'id': n_id, 'label': n_id, 'type': n_type}
-                    if n_type == 'Employee' and rec:
-                        for field in ('status', 'available_since', 'softblock_job', 'softblock_company', 'softblock_manager', 'softblock_start', 'softblock_expiry'):
-                            item[field] = rec.get(field)
-                        item['status'] = item['status'] or 'AVAILABLE'
-                    nodes.append(item)
-            def add_l(src, tgt, rel):
-                if not any((l['source'] == src and l['target'] == tgt and l['type'] == rel) for l in links):
-                    links.append({'source': src, 'target': tgt, 'type': rel})
-
-            for job in mongo_db['pending_neo4j_queue'].find({}, {'records': 1}):
-                for rec in job.get('records', []):
-                    emp_name = rec.get('emp_name', '')
-                    client_name = rec.get('client_name', '')
-                    skills = rec.get('skills', [])
-                    misc_skills = rec.get('misc_skills', [])
-                    domains = rec.get('domain', [])
-                    locations = rec.get('location', [])
-                    levels = rec.get('level', [])
-                    
-                    if emp_name and emp_name.lower() == node_lower:
-                        add_n(emp_name, 'Employee', rec)
-                        if client_name and client_name not in ('nan', '', 'None'):
-                            add_n(client_name, 'Client')
-                            add_l(emp_name, client_name, 'WORKED_FOR')
-                        for sk in skills:
-                            if sk: add_n(sk, 'Skill'); add_l(emp_name, sk, 'HAS_SKILL')
-                        for sk in misc_skills:
-                            if sk: add_n(sk, 'Skill'); add_l(emp_name, sk, 'HAS_MISC_SKILL')
-                        for dom in domains:
-                            if dom: add_n(dom, 'Domain'); add_l(emp_name, dom, 'HAS_DOMAIN')
-                        for loc in locations:
-                            if loc: add_n(loc, 'Location'); add_l(emp_name, loc, 'HAS_LOCATION')
-                        for lvl in levels:
-                            if lvl: add_n(lvl, 'Level'); add_l(emp_name, lvl, 'HAS_LEVEL')
-                    
-                    elif client_name and client_name.lower() == node_lower:
-                        add_n(client_name, 'Client')
-                        add_n(emp_name, 'Employee', rec)
-                        add_l(emp_name, client_name, 'WORKED_FOR')
-                        
-                    elif any(s and s.lower() == node_lower for s in skills):
-                        matched = next(s for s in skills if s.lower() == node_lower)
-                        add_n(matched, 'Skill')
-                        add_n(emp_name, 'Employee', rec)
-                        add_l(emp_name, matched, 'HAS_SKILL')
-                        
-                    elif any(s and s.lower() == node_lower for s in misc_skills):
-                        matched = next(s for s in misc_skills if s.lower() == node_lower)
-                        add_n(matched, 'Skill')
-                        add_n(emp_name, 'Employee', rec)
-                        add_l(emp_name, matched, 'HAS_MISC_SKILL')
-                        
-                    elif any(d and d.lower() == node_lower for d in domains):
-                        matched = next(d for d in domains if d.lower() == node_lower)
-                        add_n(matched, 'Domain')
-                        add_n(emp_name, 'Employee', rec)
-                        add_l(emp_name, matched, 'HAS_DOMAIN')
-                        
-                    elif any(l and l.lower() == node_lower for l in locations):
-                        matched = next(l for l in locations if l.lower() == node_lower)
-                        add_n(matched, 'Location')
-                        add_n(emp_name, 'Employee', rec)
-                        add_l(emp_name, matched, 'HAS_LOCATION')
-                        
-                    elif any(l and l.lower() == node_lower for l in levels):
-                        matched = next(l for l in levels if l.lower() == node_lower)
-                        add_n(matched, 'Level')
-                        add_n(emp_name, 'Employee', rec)
-                        add_l(emp_name, matched, 'HAS_LEVEL')
-        except Exception as e:
-            print(f"Pending queue expand error: {e}")
-
+    # Overlay current MongoDB records, including changes awaiting graph sync.
+    records = [rec for batch in employee_record_batches() for rec in batch['records']]
+    canonical = {rec['emp_name']: rec for rec in records if rec.get('sync_version')}
+    canonical_ids = {rec['id']: rec for rec in canonical.values()}
+    managed = set(canonical) | set(canonical_ids)
+    imported_relations = {'WORKED_FOR', 'HAS_SKILL', 'HAS_MISC_SKILL',
+                          'HAS_DOMAIN', 'HAS_LOCATION', 'HAS_LEVEL', 'WORKS_ON'}
+    links = [link for link in links if not (
+        link['source'] in managed and link['type'] in imported_relations)]
+    node_map = {entry['id']: entry for entry in nodes}
+    for rec in records:
+        name = rec.get('emp_name')
+        if not name:
+            continue
+        employee_id = rec.get('id', name)
+        relations = [
+            ('Client', 'WORKED_FOR', [rec['client_name']] if rec.get('client_name') else []),
+            ('Project', 'WORKS_ON', [rec['current_project']] if rec.get('current_project') else []),
+            ('Skill', 'HAS_SKILL', rec.get('skills', [])),
+            ('Skill', 'HAS_MISC_SKILL', rec.get('misc_skills', [])),
+            ('Domain', 'HAS_DOMAIN', rec.get('domain', [])),
+            ('Location', 'HAS_LOCATION', rec.get('location', [])),
+            ('Level', 'HAS_LEVEL', rec.get('level', [])),
+        ]
+        is_root = node in (name, employee_id)
+        for label, relation, values in relations:
+            for value in values:
+                if value and (is_root or node == value):
+                    node_map[employee_id] = {'id': employee_id, 'label': name, 'type': 'Employee'}
+                    node_map[value] = {'id': value, 'label': value, 'type': label}
+                    edge = {'source': employee_id, 'target': value, 'type': relation}
+                    if edge not in links:
+                        links.append(edge)
+        if is_root:
+            node_map[employee_id] = {'id': employee_id, 'label': name, 'type': 'Employee'}
+    for entry in node_map.values():
+        employee = canonical_ids.get(entry['id']) or canonical.get(entry.get('label'))
+        if entry.get('type') == 'Employee' and employee:
+            entry.update(public_employee(employee))
+            entry.update(label=employee['emp_name'], type='Employee')
+    connected = {node}
+    for link in links:
+        connected.update((link['source'], link['target']))
+    nodes = [entry for entry in node_map.values()
+             if entry['id'] in connected or entry.get('label') == node]
     return jsonify({'nodes': nodes, 'links': links})
 
 def parse_skills(s):
+    if isinstance(s, list):
+        return list(dict.fromkeys(str(value).strip() for value in s if normalize_optional_text(value)))
     if not s or pd.isna(s): return []
     return [x.strip() for x in str(s).replace(';', ',').split(',') if x.strip()]
+
+def normalize_optional_text(value):
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if text.lower() in ('', 'na', 'n/a', 'none', 'null', 'nan'):
+        return None
+    return text
+
+def get_ingested_value(row, aliases):
+    columns = {re.sub(r'[^a-z0-9]', '', str(column).lower()): column for column in row.index}
+    for alias in aliases:
+        column = columns.get(re.sub(r'[^a-z0-9]', '', alias.lower()))
+        if column is not None:
+            return row.get(column)
+    return None
 
 @app.route('/ingestion/upload', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -910,11 +1002,13 @@ def upload_file():
     if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
     file = request.files['file']
     if file.filename == '': return jsonify({"error": "No file selected"}), 400
+    original_document = file.read()
+    file_stream = BytesIO(original_document)
     try:
-        if file.filename.endswith('.csv'): df = pd.read_csv(file)
-        elif file.filename.endswith(('.xls', '.xlsx')): df = pd.read_excel(file)
+        if file.filename.endswith('.csv'): df = pd.read_csv(file_stream)
+        elif file.filename.endswith(('.xls', '.xlsx')): df = pd.read_excel(file_stream)
         elif file.filename.endswith('.json'):
-            import json; data = json.loads(file.read())
+            import json; data = json.loads(original_document)
             df = pd.DataFrame([data] if isinstance(data, dict) else data)
         else: return jsonify({"error": "Unsupported file format"}), 400
     except Exception as e: return jsonify({"error": f"File parsing failed: {str(e)}"}), 400
@@ -953,7 +1047,10 @@ def upload_file():
         
         rec = {
             'emp_name': ename,
-            'client_name': str(row.get('Client_Name')).strip() if not pd.isna(row.get('Client_Name')) else None,
+            'client_name': normalize_optional_text(get_ingested_value(row, ['Client_Name'])),
+            'deployment_status': (normalize_optional_text(get_ingested_value(row, ['Deployment_Status'])) or '').upper() or None,
+            'current_project': normalize_optional_text(get_ingested_value(row, ['Current_Project', 'Current_Projects', 'Project', 'Projects'])),
+            'performance': normalize_optional_text(get_ingested_value(row, ['Performance'])),
             'skills': parse_skills(row.get('Skills')),
             'misc_skills': parse_skills(row.get('misc skill')),
             'domain': parse_skills(row.get('Domain')) if 'Domain' in df.columns else [],
@@ -968,37 +1065,23 @@ def upload_file():
         
     if not records: return jsonify({"error": "No valid employee records found"}), 400
 
-    neo4j_synced = False
-    neo4j_error = None
-    try:
-        with get_neo4j_driver() as driver:
-            with driver.session(database=NEO4J_DATABASE) as session:
-                session.run("UNWIND $records AS rec MERGE (e:Employee {name: rec.emp_name}) ON CREATE SET e.owner = $owner, e.status = 'AVAILABLE', e.available_since = rec.available_since ON MATCH SET e.owner = $owner, e.available_since = rec.available_since", records=records, owner=owner)
-                session.run("UNWIND $records AS rec WITH rec WHERE rec.client_name IS NOT NULL AND rec.client_name <> '' AND rec.client_name <> 'nan' MATCH (e:Employee {name: rec.emp_name}) MERGE (c:Client {name: rec.client_name}) ON CREATE SET c.owner = $owner MERGE (e)-[:WORKED_FOR]->(c)", records=records, owner=owner)
-                session.run("UNWIND $records AS rec UNWIND rec.skills AS skill WITH rec, skill WHERE skill <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (s:Skill {name: skill}) ON CREATE SET s.owner = $owner MERGE (e)-[:HAS_SKILL]->(s)", records=records, owner=owner)
-                session.run("UNWIND $records AS rec UNWIND rec.misc_skills AS skill WITH rec, skill WHERE skill <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (s:Skill {name: skill}) ON CREATE SET s.owner = $owner MERGE (e)-[:HAS_MISC_SKILL]->(s)", records=records, owner=owner)
-                session.run("UNWIND $records AS rec UNWIND rec.domain AS d WITH rec, d WHERE d <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (dom:Domain {name: d}) MERGE (e)-[:HAS_DOMAIN]->(dom)", records=records)
-                session.run("UNWIND $records AS rec UNWIND rec.location AS l WITH rec, l WHERE l <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (loc:Location {name: l}) MERGE (e)-[:HAS_LOCATION]->(loc)", records=records)
-                session.run("UNWIND $records AS rec UNWIND rec.level AS l WITH rec, l WHERE l <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (lvl:Level {name: l}) MERGE (e)-[:HAS_LEVEL]->(lvl)", records=records)
-                neo4j_synced = True
-    except Exception as e:
-        neo4j_error = str(e)
-        print(f"Neo4j ingestion failed (will queue): {e}")
-        # Store records in pending queue so they can be synced when Neo4j comes back
-        mongo_db['pending_neo4j_queue'].insert_one({
-            'filename': file.filename,
-            'owner': owner,
-            'today': today,
-            'records': records,
-            'queued_at': datetime.now(timezone.utc).isoformat(),
-            'user_id': str(user['_id'])
-        })
-
+    upload_id = uuid.uuid4().hex
+    document_id = document_storage.put(
+        original_document, filename=file.filename, content_type=file.mimetype,
+        metadata={'upload_id': upload_id, 'user_id': str(user['_id'])},
+    )
+    save_import(mongo_db, records, owner, upload_id)
     mongo_db['upload_history'].insert_one({
+        'id': upload_id, 'document_id': str(document_id),
+        'columns': list(df.columns), 'schema_version': 1,
+        'employee_names': list(dict.fromkeys(rec['emp_name'] for rec in records)),
         'user_id': str(user['_id']), 'user_name': user.get('name'), 'filename': file.filename,
         'timestamp': datetime.now(timezone.utc).isoformat(), 'rows_processed': len(records),
-        'neo4j_synced': neo4j_synced
+        'neo4j_synced': False
     })
+    employees = list(mongo_db['employees'].find({'source_upload_id': upload_id}))
+    neo4j_synced = sync_employees(mongo_db, get_neo4j_driver, NEO4J_DATABASE, employees)
+    mongo_db['upload_history'].update_one({'id': upload_id}, {'$set': {'neo4j_synced': neo4j_synced}})
     mongo_db['alerts'].insert_one({
         'id': f"ING-{uuid.uuid4().hex[:8]}", 'type': 'INGESTION',
         'employee': f"{len(records)} employees", 'filename': file.filename,
@@ -1008,9 +1091,11 @@ def upload_file():
     })
 
     if neo4j_synced:
-        return jsonify({"status": "success", "message": f"File ingested successfully. {len(records)} records added to knowledge graph."})
+        return jsonify({"status": "success", 'upload_id': upload_id, 'mongo_saved': True,
+                        "message": f"File stored in MongoDB. {len(records)} employees saved and synced to the knowledge graph."})
     else:
-        return jsonify({"status": "success", "message": f"File uploaded successfully. {len(records)} records queued (knowledge graph sync pending — Neo4j temporarily unavailable).", "neo4j_pending": True})
+        return jsonify({"status": "success", 'upload_id': upload_id, 'mongo_saved': True,
+                        "message": f"File and {len(records)} employees stored in MongoDB. Knowledge graph sync pending — Neo4j temporarily unavailable.", "neo4j_pending": True})
 
 @app.route('/ingestion/uploads', methods=['GET', 'OPTIONS'])
 def get_uploads():
@@ -1022,6 +1107,11 @@ def get_uploads():
     mapped_hist = []
     import uuid
     for h in hist:
+        synced = h.get('neo4j_synced', True)
+        if h.get('employee_names'):
+            synced = not mongo_db['employees'].count_documents({
+                'emp_name': {'$in': h['employee_names']}, 'neo4j_synced': False,
+            })
         mapped_hist.append({
             'id': h.get('id', uuid.uuid4().hex),
             'filename': h.get('filename', 'Unknown'),
@@ -1030,71 +1120,72 @@ def get_uploads():
             'totalNodes': h.get('rows_processed', 0) * 2,
             'totalRelationships': h.get('rows_processed', 0) * 3,
             'username': h.get('user_name', 'Unknown'),
-            'neo4j_synced': h.get('neo4j_synced', True)
+            'mongo_saved': bool(h.get('document_id')),
+            'neo4j_synced': synced
         })
     return jsonify(mapped_hist)
 
 @app.route('/ingestion/sync-pending', methods=['POST', 'OPTIONS'])
 def sync_pending_neo4j():
-    """Retry queued records into Neo4j when it comes back online."""
+    """Sync current MongoDB state; never overwrite edits with upload snapshots."""
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
-
-    pending = list(mongo_db['pending_neo4j_queue'].find({}))
-    if not pending:
-        return jsonify({"message": "No pending records to sync"})
-
-    synced = 0
-    errors = []
-    try:
-        with get_neo4j_driver() as driver:
-            for job in pending:
-                try:
-                    records = job['records']
-                    owner = job['owner']
-                    with driver.session(database=NEO4J_DATABASE) as session:
-                        session.run("UNWIND $records AS rec MERGE (e:Employee {name: rec.emp_name}) ON CREATE SET e.owner = $owner, e.status = 'AVAILABLE', e.available_since = rec.available_since ON MATCH SET e.owner = $owner, e.available_since = rec.available_since SET e.status = coalesce(rec.status, e.status, 'AVAILABLE'), e.softblock_job = rec.softblock_job, e.softblock_company = rec.softblock_company, e.softblock_manager = rec.softblock_manager, e.softblock_start = rec.softblock_start, e.softblock_expiry = rec.softblock_expiry", records=records, owner=owner)
-                        session.run("UNWIND $records AS rec WITH rec WHERE rec.client_name IS NOT NULL AND rec.client_name <> '' AND rec.client_name <> 'nan' MATCH (e:Employee {name: rec.emp_name}) MERGE (c:Client {name: rec.client_name}) ON CREATE SET c.owner = $owner MERGE (e)-[:WORKED_FOR]->(c)", records=records, owner=owner)
-                        session.run("UNWIND $records AS rec UNWIND rec.skills AS skill WITH rec, skill WHERE skill <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (s:Skill {name: skill}) ON CREATE SET s.owner = $owner MERGE (e)-[:HAS_SKILL]->(s)", records=records, owner=owner)
-                        session.run("UNWIND $records AS rec UNWIND rec.misc_skills AS skill WITH rec, skill WHERE skill <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (s:Skill {name: skill}) ON CREATE SET s.owner = $owner MERGE (e)-[:HAS_MISC_SKILL]->(s)", records=records, owner=owner)
-                        session.run("UNWIND $records AS rec UNWIND rec.domain AS d WITH rec, d WHERE d <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (dom:Domain {name: d}) MERGE (e)-[:HAS_DOMAIN]->(dom)", records=records)
-                        session.run("UNWIND $records AS rec UNWIND rec.location AS l WITH rec, l WHERE l <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (loc:Location {name: l}) MERGE (e)-[:HAS_LOCATION]->(loc)", records=records)
-                        session.run("UNWIND $records AS rec UNWIND rec.level AS l WITH rec, l WHERE l <> '' MATCH (e:Employee {name: rec.emp_name}) MERGE (lvl:Level {name: l}) MERGE (e)-[:HAS_LEVEL]->(lvl)", records=records)
-                    mongo_db['pending_neo4j_queue'].delete_one({'_id': job['_id']})
-                    # Mark upload history as synced
-                    mongo_db['upload_history'].update_one(
-                        {'user_id': job['user_id'], 'filename': job['filename']},
-                        {'$set': {'neo4j_synced': True}}
-                    )
-                    synced += 1
-                except Exception as je:
-                    errors.append(str(je))
-    except Exception as e:
-        return jsonify({"error": f"Neo4j still unreachable: {str(e)}"}), 503
-
-    return jsonify({"synced": synced, "errors": errors, "message": f"Synced {synced} jobs to Neo4j"})
+    if not user: return jsonify({'error': 'Unauthorized'}), 401
+    repair_softblocked_deployment_status(mongo_db)
+    # Migrate old queued imports only when a permanent employee does not exist.
+    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$ne': 'job'}}):
+        for rec in job.get('records', []):
+            if rec.get('emp_name') and not find_employee(mongo_db, rec['emp_name']):
+                save_import(mongo_db, [rec], job.get('owner'), job.get('id'))
+    pending = list(mongo_db['employees'].find({'neo4j_synced': False}))
+    if not sync_employees(mongo_db, get_neo4j_driver, NEO4J_DATABASE, pending):
+        return jsonify({'error': 'Knowledge graph unavailable; changes remain saved in MongoDB'}), 503
+    # Mark each upload by its employees, including repeated filenames.
+    for upload in mongo_db['upload_history'].find({}):
+        names = upload.get('employee_names')
+        if names:
+            remaining = mongo_db['employees'].count_documents({
+                'emp_name': {'$in': names}, 'neo4j_synced': False,
+            })
+            mongo_db['upload_history'].update_one({'_id': upload['_id']}, {'$set': {'neo4j_synced': remaining == 0}})
+    for job in mongo_db['pending_neo4j_queue'].find({'type': {'$ne': 'job'}}):
+        names = [rec['emp_name'] for rec in job.get('records', []) if rec.get('emp_name')]
+        if not mongo_db['employees'].count_documents({'emp_name': {'$in': names}, 'neo4j_synced': False}):
+            mongo_db['pending_neo4j_queue'].delete_one({'_id': job['_id']})
+            mongo_db['upload_history'].update_many(
+                {'user_id': job.get('user_id'), 'filename': job.get('filename'), 'id': {'$exists': False}},
+                {'$set': {'neo4j_synced': True}},
+            )
+    return jsonify({'synced': len(pending), 'message': f'Synced {len(pending)} employees to Neo4j'})
 
 @app.route('/ingestion/clear', methods=['POST', 'OPTIONS'])
 def clear_database():
-    """Clear upload history, pending queue, and Neo4j database."""
+    """Clear ingested documents, employees, upload history, and the graph."""
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
+    if not user: return jsonify({'error': 'Unauthorized'}), 401
 
     try:
-        mongo_db['upload_history'].delete_many({})
-        mongo_db['pending_neo4j_queue'].delete_many({})
-
-        neo4j_cleared = False
+        # Keep saved records if graph deletion fails, so stale graph data cannot
+        # reappear after MongoDB has already been cleared.
         try:
             with get_neo4j_driver() as driver:
                 with driver.session(database=NEO4J_DATABASE) as session:
-                    session.run("MATCH (e:Employee) DETACH DELETE e")
-                    session.run("MATCH (n) WHERE NOT (n)--() AND NOT n:Job DETACH DELETE n")
-            neo4j_cleared = True
-        except Exception as e:
-            print(f"Neo4j clear failed: {e}")
+                    def clear_graph(tx):
+                        tx.run("MATCH (e:Employee) DETACH DELETE e").consume()
+                        tx.run("MATCH (n) WHERE NOT (n)--() AND NOT n:Job DETACH DELETE n").consume()
+                    session.execute_write(clear_graph)
+        except Exception:
+            return jsonify({'error': 'Neo4j is unavailable. Saved MongoDB records have been retained; retry clearing later.'}), 503
+        for upload in mongo_db['upload_history'].find({}, {'document_id': 1}):
+            if upload.get('document_id'):
+                from bson import ObjectId
+                document_storage.delete(ObjectId(upload['document_id']))
+        mongo_db['employees'].delete_many({})
+        mongo_db['upload_history'].delete_many({})
+        mongo_db['pending_neo4j_queue'].delete_many({})
 
-        return jsonify({"status": "success", "message": "Database cleared successfully." if neo4j_cleared else "MongoDB cleared, but Neo4j is offline."})
+        return jsonify({"status": "success", "message": "Database cleared successfully."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

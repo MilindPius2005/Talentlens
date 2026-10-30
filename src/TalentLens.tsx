@@ -5,6 +5,7 @@ import DatasetFilters from './DatasetFilters';
 import OntologyGraph from './OntologyGraph';
 import SearchBar from './SearchBar';
 import { useOntologyExplorer } from './useOntologyExplorer';
+import { getDeploymentStatuses } from './deploymentStatuses';
 
 const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 
@@ -180,11 +181,12 @@ function agingPct(days) { return Math.min(100, (days / 90) * 100); }
 function statusBadge(status) {
   const map = {
     AVAILABLE:["badge-status badge-available","● Available"],
+    DEPLOYED:["badge-status badge-mapped","✓ Deployed"],
     SOFTBLOCKED:["badge-status badge-softblock","◐ Soft-blocked"],
     TRAINING:["badge-status badge-training","◈ Training"],
     MAPPED:["badge-status badge-mapped","✓ Mapped"],
   };
-  const [cls, label] = map[status] || ["badge-status", status];
+  const [cls, label] = map[status] || ["badge-status", status ? status.charAt(0) + status.slice(1).toLowerCase() : ""];
   return <span className={cls}>{label}</span>;
 }
 function matchScore(employee, job) {
@@ -249,7 +251,7 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
         <div className="stat-card"><div className="stat-value" style={{ color: T.green }}>{openJobs.length}</div><div className="stat-label">Open jobs</div></div>
         <div className="stat-card"><div className="stat-value" style={{ color: T.amber }}>{softblocked.length}</div><div className="stat-label">Soft-blocked employees</div></div>
       </div>
-      <div className="grid2" style={{ marginBottom: 20 }}>
+      <div className="grid3" style={{ marginBottom: 20 }}>
         <div className="card">
           <div className="card-title">Recent HR alerts</div>
           {alerts.slice(-4).reverse().map(a => (
@@ -273,6 +275,21 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
               </div>
             </div>
           ))}
+        </div>
+        <div className="card">
+          <div className="card-title">Bench aging snapshot</div>
+          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+            {available.map(e => {
+              const days = daysSince(e.available_since);
+              return (
+                <div key={e.id} style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  <div style={{ width:110, fontSize:13, fontWeight:500, flexShrink:0 }}>{e.name.split(" ")[0]}</div>
+                  <AgingBar days={days} />
+                  {days >= 45 && <span style={{ fontSize:11, color:T.red, fontWeight:700 }}>ALERT</span>}
+                </div>
+              );
+            })}
+          </div>
         </div>
         <div className="card">
           <div className="card-title">Soft-blocked personnel</div>
@@ -341,7 +358,7 @@ function Employees({ employees, setEmployees, user, setAlerts, pendingRequests =
       <div className="card">
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Name</th><th>Status</th><th>Bench age</th><th>Skills</th><th>Interviews</th><th>Alert</th></tr></thead>
+            <thead><tr><th>Name</th><th>Deployment Status</th><th>Bench age</th><th>Skills</th><th>Interviews</th><th>Alert</th></tr></thead>
             <tbody>
               {employees.map(e => {
                 const days = e.status !== "MAPPED" ? daysSince(e.available_since) : 0;
@@ -350,7 +367,7 @@ function Employees({ employees, setEmployees, user, setAlerts, pendingRequests =
                 return (
                   <tr key={e.id} style={{ cursor:"pointer", background: isPending ? "#FBF3E0" : "transparent" }} onClick={() => setSelected(e)}>
                     <td style={{ fontWeight:600 }}>{e.name} {isPending && <span style={{ fontSize: 10, padding: "2px 6px", background: "#B8710F", color: "#fff", borderRadius: 10, marginLeft: 6 }}>PENDING</span>}</td>
-                    <td>{statusBadge(e.status)}</td>
+                    <td>{statusBadge(e.deployment_status || e.status)}</td>
                     <td style={{ minWidth:140 }}><AgingBar days={days} /></td>
                     <td><div className="skill-chips">{e.skills.slice(0,3).map(s => <span key={s.name} className="skill-chip">{s.name} {s.proficiency}</span>)}{e.skills.length > 3 && <span className="skill-chip">+{e.skills.length-3}</span>}</div></td>
                     <td style={{ color: T.muted }}>{e.interviews.length}</td>
@@ -404,7 +421,9 @@ function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
           const todayStr = new Date().toISOString().split("T")[0];
           onUpdate({
             ...emp,
+            ...resData?.employee,
             status: action === "softblock" ? "SOFTBLOCKED" : "AVAILABLE",
+            deployment_status: resData?.employee?.deployment_status || (action === "softblock" ? "SOFTBLOCKED" : "AVAILABLE"),
             softblock_job: action === "softblock" ? payload.job_position : null,
             softblock_company: action === "softblock" ? payload.company_name : null,
             softblock_manager: action === "softblock" ? (payload.manager_name || user?.name || "Admin") : null,
@@ -1238,6 +1257,7 @@ function Ingestion({ user }) {
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState("");
   const [history, setHistory] = useState([]);
   
@@ -1277,8 +1297,25 @@ function Ingestion({ user }) {
     }
   }
 
+  async function handleSyncGraph() {
+    setSyncing(true);
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/ingestion/sync-pending`, { method: "POST", credentials: "include" });
+      const data = await parseJsonSafe(res);
+      if (!res.ok) throw new Error(data?.error || "Graph sync failed");
+      const historyRes = await fetch(`${API_BASE}/ingestion/uploads`, { credentials: "include" });
+      const uploads = await parseJsonSafe(historyRes);
+      if (Array.isArray(uploads)) setHistory(uploads);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   async function handleClearDatabase() {
-    if (!window.confirm("Are you sure you want to clear the entire Neo4j database and all upload history? This action cannot be undone.")) return;
+    if (!window.confirm("Clear all ingested documents and employee records from MongoDB, the Neo4j graph, and upload history? This action cannot be undone.")) return;
     setClearing(true);
     setError("");
     try {
@@ -1326,7 +1363,10 @@ function Ingestion({ user }) {
       </div>
       
       <div className="card">
-        <div className="card-title">Upload History</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div className="card-title" style={{ marginBottom: 0 }}>Upload History</div>
+          <button className="btn btn-ghost btn-sm" onClick={handleSyncGraph} disabled={syncing || uploading || clearing}>{syncing ? "Syncing..." : "Retry graph sync"}</button>
+        </div>
         {history.length === 0 ? (
           <div className="empty">No uploads yet.</div>
         ) : (
@@ -1340,6 +1380,7 @@ function Ingestion({ user }) {
                   <th>Nodes Added</th>
                   <th>Relationships Added</th>
                   <th>User</th>
+                  <th>Storage</th>
                 </tr>
               </thead>
               <tbody>
@@ -1351,6 +1392,7 @@ function Ingestion({ user }) {
                     <td>{h.totalNodes}</td>
                     <td>{h.totalRelationships}</td>
                     <td>{h.username}</td>
+                    <td>{h.mongo_saved ? "Saved in MongoDB · " : ""}{h.neo4j_synced ? "Graph synced" : "Graph sync pending"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1362,7 +1404,7 @@ function Ingestion({ user }) {
   );
 }
 
-function GraphView({ user, setEmployees, setAlerts }) {
+function GraphView({ user, employees, setEmployees, setAlerts }) {
   const {
     searchQuery,
     setSearchQuery,
@@ -1390,22 +1432,68 @@ function GraphView({ user, setEmployees, setAlerts }) {
   const [showSoftblockForm, setShowSoftblockForm] = useState(false);
   const [graphActionLoading, setGraphActionLoading] = useState(false);
   const [graphActionError, setGraphActionError] = useState('');
+  const [editingEmployee, setEditingEmployee] = useState(null);
+  const [savingEmployee, setSavingEmployee] = useState(false);
+  const [employeeMessage, setEmployeeMessage] = useState("");
+  const deploymentStatuses = getDeploymentStatuses(
+    employees, [selectedNode?.deployment_status, editingEmployee?.deployment_status]
+  );
+
+  function selectEmployeeNode(node) {
+    const employee = employees.find(emp => emp.id === node.id || emp.name === node.label);
+    setSelectedNode({ ...node, ...employee });
+    setEditingEmployee(null);
+    setShowSoftblockForm(false);
+    setEmployeeMessage("");
+    setGraphActionError("");
+  }
+
+  function applySavedEmployee(employee) {
+    setEmployees(prev => prev.map(emp => emp.id === employee.id || emp.name === employee.name ? employee : emp));
+    setSelectedNode(prev => prev ? { ...prev, ...employee } : prev);
+    setGraph(prev => ({ ...prev, nodes: prev.nodes.map(node =>
+      node.id === employee.id || node.label === employee.name ? { ...node, ...employee } : node) }));
+  }
+
+  async function saveEmployee(event) {
+    event.preventDefault();
+    setSavingEmployee(true);
+    setEmployeeMessage("");
+    try {
+      const res = await fetch(`${API_BASE}/employees/${encodeURIComponent(selectedNode.id)}`, {
+        method: "PUT", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(editingEmployee),
+      });
+      const data = await parseJsonSafe(res);
+      if (!res.ok || !data?.employee) throw new Error(data?.error || "Unable to save employee");
+      applySavedEmployee(data.employee);
+      setEditingEmployee(null);
+      // Refresh visible relationships after a client or project assignment changes.
+      const graphRes = await fetch(`${API_BASE}/expand/${encodeURIComponent(rootNode)}`, { credentials: "include" });
+      const updatedGraph = await parseJsonSafe(graphRes);
+      if (graphRes.ok && updatedGraph?.nodes) setGraph(updatedGraph);
+      setEmployeeMessage(data.neo4j_pending ? "Saved. Graph sync is pending." : "Employee saved.");
+    } catch (error) {
+      setEmployeeMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingEmployee(false);
+    }
+  }
 
   async function handleFilterChange(filters, benchRange) {
     setFilters({ ...filters, ...benchRange });
     const params = new URLSearchParams();
     if (benchRange.min > 0) params.append('benchMin', benchRange.min);
     if (benchRange.max < 365) params.append('benchMax', benchRange.max);
-    if (filters.client) params.append('client', filters.client);
-    if (filters.location) params.append('location', filters.location);
-    if (filters.domain) params.append('domain', filters.domain);
+    if (filters.client && filters.client !== '__ALL_CLIENTS__') params.append('client', filters.client);
     if (filters.level) params.append('level', filters.level);
     if (filters.status) params.append('status', filters.status);
     if (filters.skills && filters.skills.length > 0) params.append('skills', filters.skills.join(','));
 
     // Check if any filter is actually active
     const hasFilter = [...params.keys()].some(k => !['benchMin','benchMax'].includes(k)) || params.has('benchMin') || params.has('benchMax');
-    if (!hasFilter || (filters.client === "" && filters.location === "" && filters.domain === "" && filters.status === "" && filters.level === "" && filters.skills.length === 0 && benchRange.min === 0 && benchRange.max === 365)) {
+    if (!hasFilter || ((filters.client === "" || filters.client === '__ALL_CLIENTS__') && filters.status === "" && filters.level === "" && filters.skills.length === 0 && benchRange.min === 0 && benchRange.max === 365)) {
       // No filters active – clear filter results and reset the graph
       setSearchResults([]);
       setPendingGraphRoot(null);
@@ -1423,7 +1511,7 @@ function GraphView({ user, setEmployees, setAlerts }) {
         id: e.name || e.id,
         label: e.name || e.id,
         type: 'Employee',
-        subtext: `${e.status || 'AVAILABLE'}${e.bench_aging != null ? ` · ${e.bench_aging}d on bench` : ''}${e.location ? ` · ${e.location}` : ''}`,
+        subtext: `${e.deployment_status || e.status || 'AVAILABLE'}${e.bench_aging != null ? ` · ${e.bench_aging}d on bench` : ''}${e.location ? ` · ${e.location}` : ''}`,
       }));
       setSearchResults(results);
       if (results.length > 0) setPendingGraphRoot(results[0].id);
@@ -1449,21 +1537,8 @@ function GraphView({ user, setEmployees, setAlerts }) {
       });
       if (res.ok) {
         const resData = await parseJsonSafe(res);
-        const updatedStatus = resData?.status || (action === 'softblock' ? 'SOFTBLOCKED' : 'AVAILABLE');
-        const updatedFields = {
-          status: updatedStatus,
-          softblock_job: action === 'softblock' ? payload.job_position : null,
-          softblock_company: action === 'softblock' ? payload.company_name : null,
-          softblock_manager: action === 'softblock' ? (payload.manager_name || user?.name || 'Admin') : null,
-          softblock_start: action === 'softblock' ? todayStr : null,
-          softblock_expiry: action === 'softblock' ? new Date(Date.now() + 15 * 86400000).toISOString().split('T')[0] : null
-        };
-        setEmployees(prev => prev.map(emp => {
-          if (emp.id !== empId && emp.name !== empId) return emp;
-          return { ...emp, ...updatedFields };
-        }));
-        setGraph(prev => ({ ...prev, nodes: prev.nodes.map(node => node.id === empId ? { ...node, ...updatedFields } : node) }));
-        setSelectedNode(prev => prev ? { ...prev, ...updatedFields } : prev);
+        if (resData?.employee) applySavedEmployee(resData.employee);
+        setEmployeeMessage(resData?.neo4j_pending ? "Saved. Graph sync is pending." : "Employee saved.");
 
         if (setAlerts) {
           if (action === "softblock") {
@@ -1510,7 +1585,7 @@ function GraphView({ user, setEmployees, setAlerts }) {
 
   return (
     <div style={{ display: "flex", height: "calc(100vh - 108px)" }}>
-      <DatasetFilters onFilterChange={handleFilterChange} API_BASE={API_BASE} />
+      <DatasetFilters onFilterChange={handleFilterChange} API_BASE={API_BASE} employees={employees} />
       
       <div style={{ display: "flex", flexDirection: "column", flex: 1, paddingLeft: 24, overflow: "hidden" }}>
         <div className="page-header" style={{ marginBottom: 12 }}>
@@ -1539,15 +1614,16 @@ function GraphView({ user, setEmployees, setAlerts }) {
             expandedNodeIds={expandedNodeIds}
             onNodeExpand={expandNodeInGraph}
             onNodeCollapse={collapseNodeInGraph}
-            onNodeSelect={(n) => { setSelectedNode(n); setShowSoftblockForm(false); setGraphActionError(''); }}
+            onNodeSelect={selectEmployeeNode}
             isLoading={isLoading}
           />
           
-          {selectedNode?.type === 'Employee' && (
+          {selectedNode && selectedNode.type === 'Employee' && (
             <div style={{
               position: "absolute", top: 16, right: 16, width: 320, background: "#ffffff",
               border: "1px solid #E2E6EF", borderRadius: 12, padding: 20,
-              boxShadow: "0 8px 24px rgba(0,0,0,0.12)", zIndex: 10
+              boxShadow: "0 8px 24px rgba(0,0,0,0.12)", zIndex: 10,
+              maxHeight: "calc(100% - 32px)", overflowY: "auto"
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
                 <div>
@@ -1560,6 +1636,36 @@ function GraphView({ user, setEmployees, setAlerts }) {
               <div style={{ marginBottom: 8, fontSize: 13, color: "#4B5563" }}>
                 <strong>Status:</strong> <span style={{ color: selectedNode.status === 'AVAILABLE' ? '#1A7A50' : '#B8710F' }}>{selectedNode.status || 'AVAILABLE'}</span>
               </div>
+              <div style={{ marginBottom: 8, fontSize: 13 }}><strong>Deployment:</strong> {selectedNode.deployment_status || "Unspecified"}</div>
+              <div style={{ marginBottom: 8, fontSize: 13 }}><strong>Client:</strong> {selectedNode.client_name || "None"}</div>
+              <div style={{ marginBottom: 8, fontSize: 13 }}><strong>Project:</strong> {selectedNode.current_project || "None"}</div>
+              {employeeMessage && <div role="status" style={{ fontSize: 13, margin: "12px 0" }}>{employeeMessage}</div>}
+              {editingEmployee ? (
+                <form onSubmit={saveEmployee} style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 16 }}>
+                  <label className="form-label">Deployment status
+                    <select className="form-select" value={editingEmployee.deployment_status} onChange={e => setEditingEmployee(prev => ({ ...prev, deployment_status: e.target.value }))}>
+                      <option value="">Unspecified</option>
+                      {deploymentStatuses.map(status => <option key={status} value={status}>{status.charAt(0) + status.slice(1).toLowerCase()}</option>)}
+                    </select>
+                  </label>
+                  {[["client_name", "Client"], ["current_project", "Current project"], ["performance", "Performance"]].map(([field, label]) => (
+                    <label key={field} className="form-label">{label}
+                      <input className="form-input" value={editingEmployee[field]} onChange={e => setEditingEmployee(prev => ({ ...prev, [field]: e.target.value }))} />
+                    </label>
+                  ))}
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button type="submit" className="btn btn-primary btn-sm" disabled={savingEmployee}>{savingEmployee ? "Saving..." : "Save changes"}</button>
+                    <button type="button" className="btn btn-ghost btn-sm" disabled={savingEmployee} onClick={() => setEditingEmployee(null)}>Cancel</button>
+                  </div>
+                </form>
+              ) : (
+                <button className="btn btn-ghost btn-sm" onClick={() => setEditingEmployee({
+                  deployment_status: selectedNode.deployment_status || "",
+                  client_name: selectedNode.client_name || "",
+                  current_project: selectedNode.current_project || "",
+                  performance: selectedNode.performance || "",
+                })}>Edit employee</button>
+              )}
               {selectedNode.available_since && (
                 <div style={{ marginBottom: 16, fontSize: 13, color: "#4B5563" }}>
                   <strong>Bench Since:</strong> {selectedNode.available_since}
@@ -1993,7 +2099,7 @@ export default function TalentLens() {
             {page === "jobs" && <Jobs jobs={jobs} setJobs={setJobs} employees={employees} />}
             {page === "interviews" && <Interviews employees={employees} setEmployees={setEmployees} />}
             {page === "alerts" && <Alerts employees={employees} alerts={alerts} onUnblock={handleUnblockFromAlert} onSnooze={handleSnoozeFromAlert} />}
-            {page === "graph" && <GraphView user={user} setEmployees={setEmployees} setAlerts={setAlerts} />}
+            {page === "graph" && <GraphView user={user} employees={employees} setEmployees={setEmployees} setAlerts={setAlerts} />}
             {page === "ingestion" && <Ingestion user={user} />}
           </div>
         </div>

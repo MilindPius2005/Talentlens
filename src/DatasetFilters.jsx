@@ -1,21 +1,21 @@
 import React, { useState, useEffect } from 'react';
 import './index.css';
+import { getDeploymentStatuses } from './deploymentStatuses';
 
-export default function DatasetFilters({ onFilterChange, API_BASE }) {
+export default function DatasetFilters({ onFilterChange, API_BASE, employees = [] }) {
   const [options, setOptions] = useState({
-    clients: [], locations: [], domains: [], skills: [], levels: [],
-    benchMin: 0, benchMax: 365
+    clients: [], skills: [], levels: [],
+    deploymentStatuses: [], benchMin: 0, benchMax: 365
   });
 
   const [benchRange, setBenchRange] = useState({ min: 0, max: 365 });
   const [filters, setFilters] = useState({
     client: "",
-    location: "",
-    domain: "",
     status: "",
     level: "",
     skills: []
   });
+  const deploymentStatuses = getDeploymentStatuses(employees, options.deploymentStatuses || []);
 
   useEffect(() => {
     fetch(`${API_BASE}/filter-options`, { credentials: "include" })
@@ -57,8 +57,6 @@ export default function DatasetFilters({ onFilterChange, API_BASE }) {
   const handleReset = () => {
     const emptyFilters = {
       client: "",
-      location: "",
-      domain: "",
       status: "",
       level: "",
       skills: []
@@ -89,7 +87,9 @@ export default function DatasetFilters({ onFilterChange, API_BASE }) {
       <div>
         <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Client Name</label>
         <select className="form-input" value={filters.client} onChange={e => handleChange('client', e.target.value)}>
-          <option value="">All Clients</option>
+          <option value="" hidden></option>
+          <option value="__ALL_CLIENTS__">All Clients</option>
+          <option value="__NO_CLIENT__">No Clients</option>
           {options.clients.map(c => <option key={c} value={c}>{c}</option>)}
         </select>
       </div>
@@ -98,26 +98,9 @@ export default function DatasetFilters({ onFilterChange, API_BASE }) {
         <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Deployment Status</label>
         <select className="form-input" value={filters.status} onChange={e => handleChange('status', e.target.value)}>
           <option value="">All Statuses</option>
-          <option value="AVAILABLE">Available</option>
-          <option value="SOFTBLOCKED">Softblocked</option>
-          <option value="TRAINING">In Training</option>
-          <option value="DEPLOYED">Deployed</option>
-        </select>
-      </div>
-
-      <div>
-        <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Location</label>
-        <select className="form-input" value={filters.location} onChange={e => handleChange('location', e.target.value)}>
-          <option value="">All Locations</option>
-          {options.locations.map(l => <option key={l} value={l}>{l}</option>)}
-        </select>
-      </div>
-      
-      <div>
-        <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Domain</label>
-        <select className="form-input" value={filters.domain} onChange={e => handleChange('domain', e.target.value)}>
-          <option value="">All Domains</option>
-          {options.domains.map(d => <option key={d} value={d}>{d}</option>)}
+          {deploymentStatuses.map(status => (
+            <option key={status} value={status}>{status.charAt(0) + status.slice(1).toLowerCase()}</option>
+          ))}
         </select>
       </div>
 
