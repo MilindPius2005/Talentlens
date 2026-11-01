@@ -68,6 +68,47 @@ npm run build
 ```
 Outputs static assets to `dist/`, deployable to any static host (or served by the backend).
 
+## GitHub Pages frontend
+
+The workflow in [.github/workflows/deploy-pages.yml](.github/workflows/deploy-pages.yml) builds and publishes the frontend on pushes to `main`, or when run manually from the Actions tab. The Pages build uses `/Talentlens/` as its asset base; regular builds and local development use `/`.
+
+Follow these steps in order:
+
+1. **Get the deployed backend URL.** Deploy Flask to an HTTPS host such as Render. If using Render, set the root directory to `backend`, build command to `pip install -r requirements.txt`, and start command to `gunicorn app:app --bind 0.0.0.0:$PORT`. Configure MongoDB and Neo4j credentials in that host's environment settings. Verify that `https://YOUR-BACKEND/healthz` responds with `OK`. GitHub Pages cannot run Flask or connect the browser directly to these databases.
+2. **Set the frontend API URL.** Open [the repository's Actions settings](https://github.com/MilindPius2005/Talentlens/settings/variables/actions), select **New repository variable**, and enter the name **`VITE_API_BASE`** and your actual backend URL as the value, for example `https://your-backend.onrender.com`. Select **Add variable**. Use **Variables**, rather than **Secrets**, because the workflow reads `vars.VITE_API_BASE`. Use the API's actual base URL, without adding `/api` unless the deployed server serves its routes under that prefix. Localhost and the example URL are not deployed backend addresses.
+3. **Enable GitHub Pages.** Open [Settings → Pages](https://github.com/MilindPius2005/Talentlens/settings/pages). Under **Build and deployment → Source**, select **GitHub Actions**. This step must be completed before the workflow's Configure GitHub Pages step can succeed. Pages is available for public repositories on GitHub Free; private repositories require a plan that includes Pages.
+4. **Commit and push these changes.** In the repository directory, review `git status`, then run:
+
+   ```bash
+   cd /Users/sarang04/Documents/Talentlens/Talentlens
+   git add .github/workflows/deploy-pages.yml package.json package-lock.json vite.config.ts vite.config.js vite.config.d.ts src/TalentLens.tsx src/useOntologyExplorer.js README.md
+   git commit -m "Configure TalentLens frontend for GitHub Pages"
+   git push origin main
+   ```
+
+5. **Watch the deployment.** Open **Actions → Deploy TalentLens frontend to GitHub Pages** and select the new run. Both **build** and **deploy** should finish successfully. To run again manually, select **Run workflow**, choose `main`, and run it. You can optionally enter a backend HTTPS URL for that manual run; it overrides the repository variable for that run only.
+6. **Open the published site.** Use the URL shown in the successful deployment, normally `https://milindpius2005.github.io/Talentlens/`. Subsequent pushes to `main` rebuild and deploy the frontend automatically.
+
+The expected site address is `https://milindpius2005.github.io/Talentlens/`. Updating `VITE_API_BASE` requires a new workflow run because Vite embeds this value at build time. The Pages build fails with a clear error when the backend URL is missing or is not HTTPS.
+
+To build and preview the Pages output locally, put your deployed backend URL in the ignored file `.env.github-pages.local`:
+
+```dotenv
+VITE_API_BASE=https://your-backend.onrender.com
+```
+
+Then run `npm run build:pages` followed by `npm run preview:pages`, and open `http://localhost:4173/Talentlens/`.
+
+`VITE_API_BASE` is public configuration. Database credentials stay in the backend host's environment settings. Pages serves the frontend only; it does not provide Flask routes or Vite's development proxy. The backend's current `SameSite=Lax` login cookies and unrestricted CORS origin reflection still need production configuration for a separate frontend domain. Browser policies may also restrict cookies between unrelated sites.
+
+If deployment fails:
+
+- **Backend URL missing:** Add the repository variable from step 2, or enter the URL in **Run workflow**. A variable in the backend host or a local `.env` does not supply the GitHub Actions build.
+- **Get Pages site failed / Not Found:** Select **GitHub Actions** under **Settings → Pages** and confirm your account has access to Pages for this repository.
+- **Permission denied / deployment rejected:** Check that repository or organization settings permit GitHub Actions and Pages deployments, and that the `github-pages` environment permits `main`.
+- **Site loads but login/API requests fail:** Check the browser network request URL, backend connectivity, CORS and session-cookie configuration. A successful static deployment does not verify the separate backend.
+- **Assets return 404:** Run the Pages workflow using `npm run build:pages`, retain the exact `/Talentlens/` path, and open the full project-site URL.
+
 ## Backend regression tests
 
 ```bash
