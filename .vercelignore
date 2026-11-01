@@ -1,0 +1,16 @@
+.git/
+.vercel/
+.venv/
+**/.venv/
+venv/
+node_modules/
+**/node_modules/
+dist/
+**/__pycache__/
+**/*.pyc
+.env
+.env.*
+**/.env
+**/.env.*
+backend/
+password_neo4jinst.txt

@@ -68,6 +68,36 @@ npm run build
 ```
 Outputs static assets to `dist/`, deployable to any static host (or served by the backend).
 
+## Vercel frontend with Render backend
+
+[vercel.json](vercel.json) deploys the React frontend as a single **Vite** project. Flask continues to run on Render at `https://talentlens-4zgu.onrender.com`.
+
+The browser calls `/api/*` on the frontend's own domain. Vercel forwards these requests to Render, removing `/api`: `/api/auth/signup` reaches Render's `/auth/signup`. The API rewrite comes before the frontend's SPA fallback. This gives browser requests and session cookies one public origin.
+
+The `build:vercel` and `dev:vercel` scripts use a Vite mode that embeds `/api` as the API base and `/` as the asset base. It overrides an old `VITE_API_BASE` value pointing directly at Render and disables Vite's standalone local Flask proxy for this deployment mode.
+
+To deploy:
+
+1. Commit and push `vercel.json`, `package.json`, `vite.config.ts`, its generated `vite.config.js`, `src/TalentLens.tsx`, `.gitignore`, `.vercelignore` and this README to the connected GitHub repository.
+2. In Vercel, use **Root Directory `./`**, **Framework Preset Vite**, **Build Command `npm run build:vercel`** and **Output Directory `dist`**. The configuration file supplies these build settings.
+3. Keep the six MongoDB and Neo4j environment variables on Render. The Vercel frontend does not need database credentials or a `VITE_API_BASE` variable.
+4. Allow Vercel to deploy the new commit, then open `/api/healthz` on the frontend domain. It should return `OK`. `/api/auth/me` should return a JSON `401` response until logged in.
+5. Test login/signup and confirm a reload preserves the session. Use `/api/health/db` to check the backend's database connections.
+
+To test the same rewrite locally using Vercel CLI:
+
+```bash
+npx vercel dev --local
+```
+
+This serves the UI locally and forwards `/api` requests to the deployed Render backend. Plain `npm run dev` instead uses the original proxy to a locally running Flask server on port 8000.
+
+If signup displays an account-service error with HTTP 404, inspect `/api/healthz`: a Vercel `NOT_FOUND` response means this rewrite configuration has not reached the deployment. Commit and deploy the configuration along with the frontend. Render's free service can take time to wake after inactivity; a successful static frontend deployment does not verify Flask or the database connections.
+
+`.vercelignore` excludes Flask source, local secrets, virtual environments and generated assets from Vercel uploads. Render deploys the backend directly from GitHub. No Vercel services or runtime bindings are required for this setup.
+
+Reference: [Vercel external rewrites](https://vercel.com/docs/routing/rewrites).
+
 ## GitHub Pages frontend
 
 The workflow in [.github/workflows/deploy-pages.yml](.github/workflows/deploy-pages.yml) builds and publishes the frontend on pushes to `main`, or when run manually from the Actions tab. The Pages build uses `/Talentlens/` as its asset base; regular builds and local development use `/`.

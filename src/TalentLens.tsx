@@ -1860,8 +1860,9 @@ export default function TalentLens() {
         body: JSON.stringify(authForm),
       });
       const data = await parseJsonSafe(res);
-      if (!res.ok) throw new Error(data?.error || "Authentication failed");
-      if (data && data.user) setUser(data.user);
+      if (!res.ok) throw new Error(data?.error || `Account service unavailable (HTTP ${res.status}). Please try again shortly.`);
+      if (!data?.user) throw new Error("The account service returned an unexpected response. Please try again shortly.");
+      setUser(data.user);
       setAuthForm({ name: "", email: "", password: "" });
     } catch (err) {
       setAuthError(err.message);
