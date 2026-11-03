@@ -88,6 +88,50 @@ class EmployeePersistenceTests(unittest.TestCase):
     def online(self):
         self.driver_factory.side_effect = None
 
+    def test_graph_reads_isolated_root_in_one_query(self):
+        class Node(dict):
+            labels = ['Skill']
+        self.session.run.return_value.__iter__.return_value = iter([
+            {'n': Node(name='Isolated'), 'r': None, 'm': None},
+        ])
+        response = self.client.get('/expand/Isolated')
+        self.assertEqual(response.json, {
+            'nodes': [{'id': 'Isolated', 'label': 'Isolated', 'type': 'Skill'}], 'links': [],
+        })
+        self.session.run.assert_called_once()
+
+    def test_graph_deduplicates_nodes_and_keeps_distinct_relationship_types(self):
+        class Node(dict):
+            labels = ['Skill']
+        source, target = Node(name='Source'), Node(name='Target')
+
+        def relation(kind):
+            value = MagicMock()
+            value.nodes, value.type = [source, target], kind
+            return value
+
+        self.session.run.return_value.__iter__.return_value = iter([
+            {'n': source, 'r': relation(kind), 'm': target}
+            for kind in ['HAS_SKILL', 'HAS_SKILL', 'HAS_MISC_SKILL']
+        ])
+        response = self.client.get('/expand/Source')
+        self.assertEqual(len(response.json['nodes']), 2)
+        self.assertEqual({link['type'] for link in response.json['links']}, {'HAS_SKILL', 'HAS_MISC_SKILL'})
+
+    def test_filter_facets_use_one_graph_query_and_merge_mongo_values(self):
+        self.upload()
+        self.session.run.reset_mock()
+        self.session.run.return_value.single.return_value = {
+            'skills': ['GraphQL'], 'clients': ['Other'], 'statuses': ['TRAINING'],
+            'locations': ['Remote'], 'domains': ['Cloud'], 'levels': ['Senior'], 'oldest': None,
+        }
+        response = self.client.get('/filter-options')
+        self.assertEqual(response.json['clients'], ['Acme', 'Other'])
+        self.assertIn('TRAINING', response.json['deploymentStatuses'])
+        self.assertIn('Python', response.json['skills'])
+        self.assertIn('GraphQL', response.json['skills'])
+        self.session.run.assert_called_once()
+
     def test_upload_persists_document_schema_and_graph(self):
         response = self.upload()
         self.assertEqual(response.status_code, 200)

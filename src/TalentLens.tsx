@@ -1,11 +1,13 @@
 // @ts-nocheck — This legacy component uses dynamic JavaScript data shapes.
-import { useState, useEffect, useRef } from "react";
+import { lazy, memo, Suspense, useCallback, useState, useEffect, useRef } from "react";
 import * as d3 from "d3";
 import DatasetFilters from './DatasetFilters';
-import OntologyGraph from './OntologyGraph';
 import SearchBar from './SearchBar';
 import { useOntologyExplorer } from './useOntologyExplorer';
 import { getDeploymentStatuses } from './deploymentStatuses';
+import { startPolling, reuseUnchangedRows } from './polling';
+
+const OntologyGraph = lazy(() => import('./OntologyGraph'));
 
 const API_BASE = (import.meta.env.VITE_API_BASE || "/api").trim().replace(/\/+$/, "");
 
@@ -1435,7 +1437,7 @@ function Ingestion({ user }) {
   );
 }
 
-function GraphView({ user, employees, setEmployees, setAlerts }) {
+const GraphView = memo(function GraphView({ user, employees, setEmployees, setAlerts }) {
   const {
     searchQuery,
     setSearchQuery,
@@ -1461,6 +1463,12 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
 
   const graphRef = useRef(null);
   const filterRequestId = useRef(0);
+  const filterController = useRef(null);
+  const filterTimer = useRef(null);
+  useEffect(() => () => {
+    clearTimeout(filterTimer.current);
+    filterController.current?.abort();
+  }, []);
   const [sbForm, setSbForm] = useState({ company_name: '', job_position: '' });
   const [showSoftblockForm, setShowSoftblockForm] = useState(false);
   const [graphActionLoading, setGraphActionLoading] = useState(false);
@@ -1472,13 +1480,20 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
     employees, [selectedNode?.deployment_status, editingEmployee?.deployment_status]
   );
 
-  function selectEmployeeNode(node) {
+  const selectEmployeeNode = useCallback((node) => {
     const employee = employees.find(emp => emp.id === node.id || emp.name === node.label);
     setSelectedNode({ ...node, ...employee });
     setEditingEmployee(null);
     setShowSoftblockForm(false);
     setEmployeeMessage("");
     setGraphActionError("");
+  }, [employees, setSelectedNode]);
+
+  function handleQueryChange(query) {
+    filterRequestId.current++;
+    clearTimeout(filterTimer.current);
+    filterController.current?.abort();
+    setSearchQuery(query);
   }
 
   function applySavedEmployee(employee) {
@@ -1514,9 +1529,12 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
     }
   }
 
-  async function handleFilterChange(filters, benchRange, clearSearch = false) {
+  function handleFilterChange(filters, benchRange, clearSearch = false) {
     const requestId = ++filterRequestId.current;
+    clearTimeout(filterTimer.current);
+    filterController.current?.abort();
     setFilters({ ...filters, ...benchRange });
+    setSearchQuery('');
     const params = new URLSearchParams();
     if (benchRange.min > 0) params.append('benchMin', benchRange.min);
     if (benchRange.max < 365) params.append('benchMax', benchRange.max);
@@ -1533,26 +1551,28 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
       return;
     }
 
-    try {
-      const res = await fetch(`${API_BASE}/employees?${params.toString()}`, { credentials: "include" });
-      if (!res.ok || requestId !== filterRequestId.current) return;
-      const employees = (await parseJsonSafe(res)) || [];
-      if (requestId !== filterRequestId.current) return;
-      // Map employees into search-result cards (same shape as /search)
-      const results = employees.slice(0, 20).map(e => ({
-        id: e.name || e.id,
-        label: e.name || e.id,
-        type: 'Employee',
-        subtext: `${e.deployment_status || e.status || 'AVAILABLE'}${e.bench_aging != null ? ` · ${e.bench_aging}d on bench` : ''}${e.location ? ` · ${e.location}` : ''}`,
-      }));
-      setSearchResults(results);
-      if (results.length > 0) setPendingGraphRoot(results[0].id);
-      else setPendingGraphRoot(null);
-      // Clear the text search so results panel shows filter results
-      setSearchQuery('');
-    } catch (err) {
-      console.error("Filter fetch error:", err);
-    }
+    const controller = new AbortController();
+    filterController.current = controller;
+    filterTimer.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/employees?${params.toString()}`, { credentials: "include", signal: controller.signal });
+        if (!res.ok || requestId !== filterRequestId.current) return;
+        const employees = (await parseJsonSafe(res)) || [];
+        if (requestId !== filterRequestId.current) return;
+        // Map employees into search-result cards (same shape as /search)
+        const results = employees.slice(0, 20).map(e => ({
+          id: e.name || e.id,
+          label: e.name || e.id,
+          type: 'Employee',
+          subtext: `${e.deployment_status || e.status || 'AVAILABLE'}${e.bench_aging != null ? ` · ${e.bench_aging}d on bench` : ''}${e.location ? ` · ${e.location}` : ''}`,
+        }));
+        setSearchResults(results);
+        if (results.length > 0) setPendingGraphRoot(results[0].id);
+        else setPendingGraphRoot(null);
+      } catch (err) {
+        if (!controller.signal.aborted) console.error("Filter fetch error:", err);
+      }
+    }, 180);
   }
   async function handleAction(action, empId) {
     if (!user) return alert("Please log in first");
@@ -1627,7 +1647,7 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
           <div style={{ marginTop: 14 }}>
             <SearchBar 
               searchQuery={searchQuery}
-              onQueryChange={setSearchQuery}
+              onQueryChange={handleQueryChange}
               searchResults={searchResults}
               pendingGraphRoot={pendingGraphRoot}
               onSelectResult={selectSearchResult}
@@ -1638,7 +1658,8 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
         </div>
 
         <div style={{ flex: 1, position: "relative", background: "#ffffff", borderRadius: 12, border: "1px solid #E2E6EF", overflow: "hidden" }}>
-          <OntologyGraph 
+          <Suspense fallback={<div style={{ padding: 20, color: T.teal }}>Loading graph view…</div>}>
+          <OntologyGraph
             ref={graphRef}
             graph={graph}
             selectedNode={selectedNode}
@@ -1649,6 +1670,7 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
             onNodeSelect={selectEmployeeNode}
             isLoading={isLoading}
           />
+          </Suspense>
           
           {selectedNode && selectedNode.type === 'Employee' && (
             <div style={{
@@ -1743,7 +1765,7 @@ function GraphView({ user, employees, setEmployees, setAlerts }) {
       </div>
     </div>
   );
-}
+});
 
 function AdminRequests() {
   const [requests, setRequests] = useState([]);
@@ -1915,93 +1937,58 @@ export default function TalentLens() {
     return () => clearInterval(t);
   }, []);
 
-  // Fetch employees and alerts from Neo4j backend
-  useEffect(() => {
-    if (user) {
-      fetch(`${API_BASE}/employees`, { credentials: "include" })
-        .then(res => parseJsonSafe(res))
-        .then(data => {
-          if (Array.isArray(data)) setEmployees(data);
-        })
-        .catch(console.error);
-
-      fetch(`${API_BASE}/jobs`, { credentials: "include" })
-        .then(res => parseJsonSafe(res))
-        .then(data => { if (Array.isArray(data)) setJobs(data); })
-        .catch(console.error);
-        
-      fetch(`${API_BASE}/alerts`, { credentials: "include" })
-        .then(res => parseJsonSafe(res))
-        .then(data => {
-          if (Array.isArray(data)) {
-            if (!knownAlertIds.current) {
-              knownAlertIds.current = new Set(data.map(a => a.id).filter(Boolean));
-              if (data.length) setNewAlertToast(`${data.length} alerts are ready to review`);
-            }
-            setAlerts(data);
-          }
-        })
-        .catch(console.error);
-    }
-  }, [user, page]);
-
-  // poll the backend so changes made from another app/script show up automatically
+  // One refresh loop for the signed-in session. Tab navigation reuses loaded data.
   useEffect(() => {
     if (!user) return;
-    let cancelled = false;
-    async function poll() {
-      try {
-        const res = await fetch(`${API_BASE}/employees`, { credentials: "include" });
-        if (!res.ok) return;
-        const apiEmployees = await parseJsonSafe(res);
-        if (cancelled || !Array.isArray(apiEmployees)) return;
-        setEmployees(prev => [
-          ...apiEmployees,
-          ...prev.filter(local => local.local_only && !apiEmployees.some(saved => saved.id === local.id || saved.name === local.name)),
-        ]);
-        setGraphEmployees(prev => prev.map(local => {
-          const match = apiEmployees.find(a => a.id === local.id);
-          if (!match) return local;
-          return {
-            ...local,
-            status: match.status,
-            location: match.location ?? local.location,
-            bench_days: match.available_since ? daysSince(match.available_since) : local.bench_days,
-            softblock_job: match.softblock_job ?? null,
-            softblock_company: match.softblock_company ?? null,
-            softblock_manager: match.softblock_manager ?? null,
-            softblock_start: match.softblock_start ?? null,
-            softblock_expiry: match.softblock_expiry ?? null,
-          };
-        }));
-        setApiConnected(true);
-      } catch (err) {
-        setApiConnected(false);
-      }
-      try {
-        const res2 = await fetch(`${API_BASE}/alerts`, { credentials: "include" });
-        if (res2.ok) {
-          const apiAlerts = await parseJsonSafe(res2);
-          if (!cancelled && Array.isArray(apiAlerts)) {
-            if (!knownAlertIds.current) {
-              knownAlertIds.current = new Set(apiAlerts.map(a => a.id).filter(Boolean));
-              if (apiAlerts.length) setNewAlertToast(`${apiAlerts.length} alerts are ready to review`);
-            }
-            setAlerts(apiAlerts);
+    return startPolling(async signal => {
+      async function read(path, apply) {
+        try {
+          const response = await fetch(`${API_BASE}${path}`, { credentials: "include", signal });
+          if (!response.ok) {
+            if (path === "/employees" && !signal.aborted) setApiConnected(false);
+            return;
           }
+          const data = await parseJsonSafe(response);
+          if (!signal.aborted && Array.isArray(data)) apply(data);
+        } catch (error) {
+          if (!signal.aborted && path === "/employees") setApiConnected(false);
         }
-      } catch (err) { /* backend not reachable yet, ignore */ }
-      try {
-        const jobsResponse = await fetch(`${API_BASE}/jobs`, { credentials: "include" });
-        if (jobsResponse.ok) {
-          const savedJobs = await parseJsonSafe(jobsResponse);
-          if (!cancelled && Array.isArray(savedJobs)) setJobs(savedJobs);
-        }
-      } catch (err) { /* keep the last loaded jobs while the backend is unavailable */ }
-    }
-    poll();
-    const interval = setInterval(poll, 8000);
-    return () => { cancelled = true; clearInterval(interval); };
+      }
+      await Promise.allSettled([
+        read("/employees", apiEmployees => {
+          const ids = new Set(apiEmployees.map(employee => employee.id));
+          const names = new Set(apiEmployees.map(employee => employee.name));
+          setEmployees(previous => reuseUnchangedRows(previous, [
+            ...apiEmployees,
+            ...previous.filter(local => local.local_only && !ids.has(local.id) && !names.has(local.name)),
+          ]));
+          const byId = new Map(apiEmployees.map(employee => [employee.id, employee]));
+          setGraphEmployees(previous => reuseUnchangedRows(previous, previous.map(local => {
+            const match = byId.get(local.id);
+            if (!match) return local;
+            return {
+              ...local, status: match.status,
+              location: match.location ?? local.location,
+              bench_days: match.available_since ? daysSince(match.available_since) : local.bench_days,
+              softblock_job: match.softblock_job ?? null,
+              softblock_company: match.softblock_company ?? null,
+              softblock_manager: match.softblock_manager ?? null,
+              softblock_start: match.softblock_start ?? null,
+              softblock_expiry: match.softblock_expiry ?? null,
+            };
+          })));
+          setApiConnected(true);
+        }),
+        read("/alerts", apiAlerts => {
+          if (!knownAlertIds.current) {
+            knownAlertIds.current = new Set(apiAlerts.map(alert => alert.id).filter(Boolean));
+            if (apiAlerts.length) setNewAlertToast(`${apiAlerts.length} alerts are ready to review`);
+          }
+          setAlerts(previous => reuseUnchangedRows(previous, apiAlerts));
+        }),
+        read("/jobs", savedJobs => setJobs(previous => reuseUnchangedRows(previous, savedJobs))),
+      ]);
+    });
   }, [user]);
 
   // fire a soft-block-expiry reminder for anyone whose 15-day window has

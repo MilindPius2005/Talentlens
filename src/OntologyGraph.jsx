@@ -1,5 +1,6 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { forwardRef, memo, useEffect, useImperativeHandle, useRef } from 'react';
 import * as d3 from 'd3';
+import { buildLayout, getLinkNodeId } from './graphLayout';
 
 const NODE_STYLES = {
   Employee:   { color: '#3B82F6', border: '#2563EB', radius: 34, ring: '#60A5FA' },
@@ -20,116 +21,6 @@ function getStyle(type) {
   return NODE_STYLES[type] || NODE_STYLES.default;
 }
 
-function getLinkNodeId(value) {
-  return typeof value === 'object' ? value.id : value;
-}
-
-// Compute a top-down tree layout: root at top, children spread downward.
-function buildLayout(nodes, links, rootNodeId, width, height) {
-  if (!nodes.length) return new Map();
-
-  const validIds = new Set(nodes.map((n) => n.id));
-  const adj = new Map(nodes.map((n) => [n.id, []]));
-  links.forEach((l) => {
-    const s = getLinkNodeId(l.source);
-    const t = getLinkNodeId(l.target);
-    if (!validIds.has(s) || !validIds.has(t)) return;
-    adj.get(s).push(t);
-    adj.get(t).push(s);
-  });
-
-  const start = (rootNodeId && validIds.has(rootNodeId)) ? rootNodeId : nodes[0].id;
-
-  // BFS to get parent-child tree structure
-  const depthMap = new Map();
-  const parentMap = new Map();
-  const childrenMap = new Map();
-  const queue = [start];
-  depthMap.set(start, 0);
-  childrenMap.set(start, []);
-  while (queue.length) {
-    const cur = queue.shift();
-    const d = depthMap.get(cur);
-    for (const nbr of (adj.get(cur) || [])) {
-      if (!depthMap.has(nbr)) {
-        depthMap.set(nbr, d + 1);
-        parentMap.set(nbr, cur);
-        if (!childrenMap.has(cur)) childrenMap.set(cur, []);
-        childrenMap.get(cur).push(nbr);
-        if (!childrenMap.has(nbr)) childrenMap.set(nbr, []);
-        queue.push(nbr);
-      }
-    }
-  }
-  // Handle disconnected nodes
-  nodes.forEach((n) => { if (!depthMap.has(n.id)) depthMap.set(n.id, 1); });
-
-  // Group by depth
-  const layers = new Map();
-  nodes.forEach((n) => {
-    const d = depthMap.get(n.id);
-    if (!layers.has(d)) layers.set(d, []);
-    layers.get(d).push(n);
-  });
-
-  const maxDepth = Math.max(...depthMap.values());
-  const verticalGap = Math.max(120, Math.min(180, (height - 120) / Math.max(maxDepth, 1)));
-  const startY = 80; // root starts near the top
-
-  // Calculate subtree widths for balanced spacing
-  function subtreeWidth(nodeId) {
-    const children = childrenMap.get(nodeId) || [];
-    if (children.length === 0) return 1;
-    return children.reduce((sum, c) => sum + subtreeWidth(c), 0);
-  }
-
-  const positions = new Map();
-  const minHGap = 100; // minimum horizontal gap between sibling nodes
-
-  // Position tree recursively
-  function positionSubtree(nodeId, leftX, depth) {
-    const y = startY + depth * verticalGap;
-    const children = childrenMap.get(nodeId) || [];
-    if (children.length === 0) {
-      positions.set(nodeId, { x: leftX + minHGap / 2, y });
-      return minHGap;
-    }
-    let totalWidth = 0;
-    const childWidths = [];
-    for (const c of children) {
-      const w = Math.max(minHGap, subtreeWidth(c) * minHGap);
-      childWidths.push(w);
-      totalWidth += w;
-    }
-    let cx = leftX;
-    for (let i = 0; i < children.length; i++) {
-      positionSubtree(children[i], cx, depth + 1);
-      cx += childWidths[i];
-    }
-    // Center the parent above its children
-    const firstChild = positions.get(children[0]);
-    const lastChild = positions.get(children[children.length - 1]);
-    const parentX = (firstChild.x + lastChild.x) / 2;
-    positions.set(nodeId, { x: parentX, y });
-    return totalWidth;
-  }
-
-  const totalTreeWidth = Math.max(minHGap, subtreeWidth(start) * minHGap);
-  const offsetX = (width - totalTreeWidth) / 2;
-  positionSubtree(start, offsetX, 0);
-
-  // Handle disconnected nodes (place them in a row below the tree)
-  let disconnectedX = 50;
-  nodes.forEach((n) => {
-    if (!positions.has(n.id)) {
-      positions.set(n.id, { x: disconnectedX, y: startY + (maxDepth + 1) * verticalGap });
-      disconnectedX += minHGap;
-    }
-  });
-
-  return positions;
-}
-
 const OntologyGraph = forwardRef(function OntologyGraph(
   { graph, selectedNode, rootNode, onNodeSelect, onNodeExpand, onNodeCollapse, expandedNodeIds, isLoading = false },
   ref
@@ -138,14 +29,14 @@ const OntologyGraph = forwardRef(function OntologyGraph(
   const svgRef      = useRef(null);
   const zoomRef     = useRef(null);
   const containerRef= useRef(null);
-  const layoutRef   = useRef(new Map());
   const positionsRef= useRef(new Map()); // dragged positions (mutable)
-  const nodesDataRef= useRef([]);
-  const linksDataRef= useRef([]);
-  const [zoomLevel, setZoomLevel] = useState(1);
+  const draggedPositionsRef = useRef(new Map());
+  const zoomLabelRef = useRef(null);
+  const interactions = useRef({});
+  interactions.current = { onNodeSelect, onNodeExpand, onNodeCollapse, expandedNodeIds };
 
   // Track whether this is a brand-new graph so we auto-center exactly once
-  const prevGraphKeyRef = useRef('');
+  const prevRootRef = useRef(null);
 
   // ---------- imperative handle ----------
   useImperativeHandle(ref, () => ({
@@ -172,10 +63,10 @@ const OntologyGraph = forwardRef(function OntologyGraph(
     const gw = Math.max(b.maxX - b.minX, 1);
     const gh = Math.max(b.maxY - b.minY, 1);
     const pad = 100;
-    const scale = Math.min(1.15, Math.max(0.4, Math.min((W - pad * 2) / gw, (H - pad * 2) / gh)));
+    const scale = Math.min(1.15, Math.max(0.1, Math.min((W - pad * 2) / gw, (H - pad * 2) / gh)));
     const tx = W / 2 - scale * (b.minX + gw / 2);
     const ty = H / 2 - scale * (b.minY + gh / 2);
-    d3.select(svgRef.current).transition().duration(500)
+    d3.select(svgRef.current).transition().duration(180)
       .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
   }
 
@@ -191,38 +82,35 @@ const OntologyGraph = forwardRef(function OntologyGraph(
     const H = wrapper.clientHeight || 650;
 
     const svg = d3.select(svgEl);
-    svg.selectAll('*').remove();
     svg.attr('viewBox', `0 0 ${W} ${H}`);
 
-    // Defs
-    const defs = svg.append('defs');
-    const shad = defs.append('filter').attr('id', 'node-shadow').attr('height', '130%');
-    shad.append('feDropShadow').attr('dx', 0).attr('dy', 3).attr('stdDeviation', 4).attr('flood-opacity', 0.1);
-
-    const container = svg.append('g').attr('class', 'zoom-container');
-    containerRef.current = container;
-
-    // Zoom — user can pan/zoom freely, but we NEVER programmatically jump unless it's a new graph
-    const zoom = d3.zoom()
-      .scaleExtent([0.25, 3])
-      .on('zoom', (ev) => {
+    // Keep the SVG, zoom behavior and existing DOM elements across expansions.
+    let container = svg.select('g.zoom-container');
+    if (container.empty()) {
+      const defs = svg.append('defs');
+      const shad = defs.append('filter').attr('id', 'node-shadow').attr('height', '130%');
+      shad.append('feDropShadow').attr('dx', 0).attr('dy', 3).attr('stdDeviation', 4).attr('flood-opacity', 0.1);
+      container = svg.append('g').attr('class', 'zoom-container');
+      container.append('g').attr('class', 'links-layer');
+      container.append('g').attr('class', 'link-labels-layer').style('pointer-events', 'none');
+      container.append('g').attr('class', 'nodes-layer');
+      const zoom = d3.zoom().scaleExtent([0.1, 3]).on('zoom', (ev) => {
         container.attr('transform', ev.transform);
-        setZoomLevel(ev.transform.k);
+        container.select('.link-labels-layer').style('display', ev.transform.k < 0.5 ? 'none' : null);
+        if (zoomLabelRef.current) zoomLabelRef.current.textContent = `${Math.round(ev.transform.k * 100)}%`;
       });
-    zoomRef.current = zoom;
-    svg.call(zoom);
-
-    // Disable double-click-to-zoom (avoids accidental zoom jumps)
-    svg.on('dblclick.zoom', null);
+      zoomRef.current = zoom;
+      svg.call(zoom).on('dblclick.zoom', null);
+    }
+    containerRef.current = container;
 
     const nodes = (graph.nodes || []).map((n) => ({ ...n }));
     const links = (graph.links || []).map((l) => ({ ...l }));
-    nodesDataRef.current = nodes;
-    linksDataRef.current = links;
-
     if (!nodes.length) {
-      layoutRef.current   = new Map();
-      positionsRef.current= new Map();
+      container.selectAll('.links-layer > *, .link-labels-layer > *, .nodes-layer > *').remove();
+      positionsRef.current = new Map();
+      draggedPositionsRef.current.clear();
+      prevRootRef.current = null;
       return;
     }
 
@@ -233,26 +121,25 @@ const OntologyGraph = forwardRef(function OntologyGraph(
 
     // Compute stable layout
     const layout = buildLayout(nodes, validLinks, rootNode, W, H);
-    layoutRef.current = layout;
-
-    // Initialize draggable positions from layout (only for NEW graph)
-    const graphKey = nodes.map((n) => n.id).sort().join('|');
-    const isNewGraph = graphKey !== prevGraphKeyRef.current;
-    if (isNewGraph) {
-      positionsRef.current = new Map(layout);
-      prevGraphKeyRef.current = graphKey;
+    const isNewGraph = prevRootRef.current !== rootNode || !positionsRef.current.size;
+    if (isNewGraph) draggedPositionsRef.current.clear();
+    prevRootRef.current = rootNode;
+    positionsRef.current = layout;
+    for (const [id, position] of draggedPositionsRef.current) {
+      if (nodeIds.has(id)) layout.set(id, position);
+      else draggedPositionsRef.current.delete(id);
     }
-
     const positions = positionsRef.current;
 
     // ── Layers ──
-    const linkLayer      = container.append('g').attr('class', 'links-layer');
-    const linkLabelLayer = container.append('g').attr('class', 'link-labels-layer');
-    const nodeLayer      = container.append('g').attr('class', 'nodes-layer');
+    const linkLayer      = container.select('.links-layer');
+    const linkLabelLayer = container.select('.link-labels-layer');
+    const nodeLayer      = container.select('.nodes-layer');
+    const linkKey = d => JSON.stringify([getLinkNodeId(d.source), getLinkNodeId(d.target), d.type]);
 
     // ── Links ──
     const linkEls = linkLayer.selectAll('path')
-      .data(validLinks)
+      .data(validLinks, linkKey)
       .join('path')
       .attr('fill', 'none')
       .attr('stroke', '#CBD5E1')
@@ -261,33 +148,45 @@ const OntologyGraph = forwardRef(function OntologyGraph(
 
     // Link labels
     const linkLabelGs = linkLabelLayer.selectAll('g.ll')
-      .data(validLinks)
+      .data(validLinks, linkKey)
       .join('g').attr('class', 'll')
       .style('pointer-events', 'none');
-    linkLabelGs.append('rect').attr('rx', 4).attr('ry', 4)
+    linkLabelGs.selectAll('rect').data(d => [d]).join('rect').attr('rx', 4).attr('ry', 4)
       .attr('fill', '#FFFFFF').attr('stroke', '#E2E8F0').attr('stroke-width', 1).attr('height', 16);
-    linkLabelGs.append('text')
+    linkLabelGs.selectAll('text').data(d => [d]).join('text')
       .attr('font-size', '9px').attr('font-weight', '600').attr('fill', '#64748B')
       .attr('text-anchor', 'middle').attr('dy', 11)
       .text((d) => (d.type || '').replace(/^HAS_/, '').replace(/_/g, ' '));
 
-    function updateLinks() {
-      linkEls.attr('d', (d) => {
+    // Size label backgrounds once. Dragging never reads browser layout.
+    linkLabelGs.select('rect')
+      .attr('width', d => Math.max(16, (d.type || '').replace(/^HAS_/, '').replace(/_/g, ' ').length * 5.8 + 8))
+      .attr('x', d => -Math.max(16, (d.type || '').replace(/^HAS_/, '').replace(/_/g, ' ').length * 5.8 + 8) / 2);
+    const incidentPaths = new Map(), incidentLabels = new Map();
+    function indexLinks(selection, index) {
+      selection.each(function(d) {
+        for (const id of new Set([getLinkNodeId(d.source), getLinkNodeId(d.target)])) {
+          if (!index.has(id)) index.set(id, []);
+          index.get(id).push(this);
+        }
+      });
+    }
+    indexLinks(linkEls, incidentPaths);
+    indexLinks(linkLabelGs, incidentLabels);
+    function updateLinks(nodeId) {
+      const paths = nodeId == null ? linkEls : d3.selectAll(incidentPaths.get(nodeId) || []);
+      const labels = nodeId == null ? linkLabelGs : d3.selectAll(incidentLabels.get(nodeId) || []);
+      paths.attr('d', (d) => {
         const s = positions.get(getLinkNodeId(d.source)) || { x: W / 2, y: H / 2 };
         const t = positions.get(getLinkNodeId(d.target)) || { x: W / 2, y: H / 2 };
         const my = (s.y + t.y) / 2;
         return `M${s.x},${s.y} C${s.x},${my} ${t.x},${my} ${t.x},${t.y}`;
       });
-      linkLabelGs.each(function (d) {
+      labels.each(function (d) {
         const s = positions.get(getLinkNodeId(d.source)) || { x: W / 2, y: H / 2 };
         const t = positions.get(getLinkNodeId(d.target)) || { x: W / 2, y: H / 2 };
         const mx = (s.x + t.x) / 2, my = (s.y + t.y) / 2;
-        const g  = d3.select(this);
-        const txt= g.select('text');
-        const bx = txt.node() ? txt.node().getBBox() : { width: 36 };
-        const p  = 6;
-        g.select('rect').attr('x', -bx.width / 2 - p / 2).attr('y', 0).attr('width', bx.width + p);
-        g.attr('transform', `translate(${mx},${my - 8})`);
+        d3.select(this).attr('transform', `translate(${mx},${my - 8})`);
       });
     }
     updateLinks();
@@ -303,7 +202,7 @@ const OntologyGraph = forwardRef(function OntologyGraph(
       });
 
     // Collapse ring (shown when expanded & not root)
-    nodeGs.append('circle').attr('class', 'c-ring')
+    nodeGs.selectAll('circle.c-ring').data(d => [d]).join('circle').attr('class', 'c-ring')
       .attr('r', (d) => getStyle(d.type).radius + 10)
       .attr('fill', 'none')
       .attr('stroke', '#10B981').attr('stroke-width', 2.5).attr('stroke-dasharray', '5 4')
@@ -311,14 +210,14 @@ const OntologyGraph = forwardRef(function OntologyGraph(
       .attr('opacity', (d) => expandedNodeIds?.has(d.id) ? 1 : 0);
 
     // Main circle
-    nodeGs.append('circle').attr('class', 'node-circle')
+    nodeGs.selectAll('circle.node-circle').data(d => [d]).join('circle').attr('class', 'node-circle')
       .attr('r', (d) => getStyle(d.type).radius)
       .attr('fill', (d) => d.type === 'Employee' && d.status === 'SOFTBLOCKED' ? '#B8710F' : getStyle(d.type).color)
       .attr('stroke', '#FFFFFF').attr('stroke-width', 3)
-      .attr('filter', 'url(#node-shadow)');
+      .attr('filter', nodes.length > 200 ? null : 'url(#node-shadow)');
 
     // Initials
-    nodeGs.append('text').attr('class', 'node-init')
+    nodeGs.selectAll('text.node-init').data(d => [d]).join('text').attr('class', 'node-init')
       .attr('text-anchor', 'middle').attr('dominant-baseline', 'central')
       .attr('font-size', (d) => (d.id === rootNode || d.type === 'Employee') ? '14px' : '11px')
       .attr('font-weight', '700').attr('fill', '#FFFFFF').attr('pointer-events', 'none')
@@ -332,9 +231,9 @@ const OntologyGraph = forwardRef(function OntologyGraph(
       });
 
     // Label group
-    const lblG = nodeGs.append('g').attr('class', 'node-lbl')
+    const lblG = nodeGs.selectAll('g.node-lbl').data(d => [d]).join('g').attr('class', 'node-lbl')
       .attr('transform', (d) => `translate(0,${getStyle(d.type).radius + 18})`);
-    lblG.append('text').attr('class', 'n-title')
+    lblG.selectAll('text.n-title').data(d => [d]).join('text').attr('class', 'n-title')
       .attr('text-anchor', 'middle')
       .attr('font-size', (d) => d.id === rootNode ? '13px' : '11.5px')
       .attr('font-weight', (d) => d.id === rootNode ? '700' : '600')
@@ -342,7 +241,7 @@ const OntologyGraph = forwardRef(function OntologyGraph(
       .style('paint-order', 'stroke').style('stroke', '#FFFFFF')
       .style('stroke-width', '3px').style('stroke-linejoin', 'round')
       .text((d) => { const n = d.label || d.id; return n.length > 22 ? n.slice(0, 20) + '…' : n; });
-    lblG.append('text').attr('class', 'n-sub')
+    lblG.selectAll('text.n-sub').data(d => [d]).join('text').attr('class', 'n-sub')
       .attr('text-anchor', 'middle').attr('y', 15)
       .attr('font-size', '10px').attr('font-weight', '500')
       .attr('fill', (d) => {
@@ -360,16 +259,16 @@ const OntologyGraph = forwardRef(function OntologyGraph(
     // ── Click ──
     function handleClick(event, d) {
       event.stopPropagation();
-      if (onNodeSelect) onNodeSelect(d);
-      const isExp = expandedNodeIds?.has(d.id);
+      interactions.current.onNodeSelect?.(d);
+      const isExp = interactions.current.expandedNodeIds?.has(d.id);
       const sty   = getStyle(d.type);
       if (isExp) {
         d3.select(event.currentTarget).select('circle.node-circle')
           .transition().duration(100).attr('r', sty.radius * 1.25)
           .transition().duration(130).attr('r', sty.radius)
-          .on('end', () => { if (onNodeCollapse) onNodeCollapse(d); });
+          .on('end', () => interactions.current.onNodeCollapse?.(d));
       } else if (!isExp) {
-        if (onNodeExpand) onNodeExpand(d);
+        interactions.current.onNodeExpand?.(d);
       }
     }
     nodeGs.on('click', handleClick);
@@ -389,7 +288,7 @@ const OntologyGraph = forwardRef(function OntologyGraph(
               <div style="font-weight:700;font-size:13px;color:#0F172A;margin-bottom:2px">${d.label || d.id}</div>
               <div style="font-size:11px;color:#64748B">${d.type || 'Node'}</div>
               ${d.id === rootNode ? `<div style="font-size:11px;color:#2563EB;margin-top:2px;font-weight:600">★ Root Node</div>` : ''}
-              <div style="font-size:10px;color:#94A3B8;margin-top:4px">${expandedNodeIds?.has(d.id) ? 'Click to collapse' : 'Click to expand'}</div>
+              <div style="font-size:10px;color:#94A3B8;margin-top:4px">${interactions.current.expandedNodeIds?.has(d.id) ? 'Click to collapse' : 'Click to expand'}</div>
             `);
         }
       })
@@ -399,22 +298,29 @@ const OntologyGraph = forwardRef(function OntologyGraph(
       });
 
     // ── Drag ──
+    let dragFrame;
     const drag = d3.drag()
-      .on('start', function () { d3.select(this).raise(); })
+      .clickDistance(4)
+      .subject((event, node) => positions.get(node.id))
       .on('drag', function (ev, d) {
         positions.set(d.id, { x: ev.x, y: ev.y });
+        draggedPositionsRef.current.set(d.id, { x: ev.x, y: ev.y });
         d3.select(this).attr('transform', `translate(${ev.x},${ev.y})`);
-        updateLinks();
+        if (dragFrame) cancelAnimationFrame(dragFrame);
+        dragFrame = requestAnimationFrame(() => { dragFrame = null; updateLinks(d.id); });
       });
     nodeGs.call(drag);
 
     // Auto-center only on brand-new graph load
-    if (isNewGraph) {
-      const t = window.setTimeout(doCenter, 400);
-      return () => window.clearTimeout(t);
-    }
+    const centerFrame = isNewGraph ? requestAnimationFrame(doCenter) : null;
+    return () => {
+      if (centerFrame) cancelAnimationFrame(centerFrame);
+      if (dragFrame) cancelAnimationFrame(dragFrame);
+      nodeGs.interrupt();
+      nodeGs.selectAll('*').interrupt();
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graph]); // ← ONLY graph data triggers full redraw
+  }, [graph, rootNode]);
 
   // ─── LIGHTWEIGHT STYLE UPDATE EFFECT ─────────────────────────────────
   // Handles expand/collapse ring + selection ring changes WITHOUT redrawing.
@@ -429,7 +335,7 @@ const OntologyGraph = forwardRef(function OntologyGraph(
         .attr('opacity', isExp ? 1 : 0);
       g.select('text.n-sub')
         .attr('fill', isExp ? '#059669' : d.id === rootNode ? '#2563EB' : '#64748B')
-        .text(isExp ? 'expanded ↓' : d.id === rootNode ? '● Root' : d.type || 'Node');
+        .text(d.type === 'Employee' && d.status === 'SOFTBLOCKED' ? 'Soft-blocked' : isExp ? 'expanded ↓' : d.id === rootNode ? '● Root' : d.type || 'Node');
     });
   }, [expandedNodeIds, selectedNode, rootNode]);
 
@@ -455,7 +361,7 @@ const OntologyGraph = forwardRef(function OntologyGraph(
             style={{ width: 28, height: 28, borderRadius: 6, border: '1px solid #CBD5E1', background: '#F8FAFC', fontWeight: 700, cursor: 'pointer', fontSize: 16 }}>−</button>
           <button onClick={doCenter}
             style={{ padding: '0 10px', height: 28, borderRadius: 6, border: '1px solid #CBD5E1', background: '#F8FAFC', fontSize: 11, fontWeight: 600, color: '#475569', cursor: 'pointer' }}>
-            ⊙ Fit ({Math.round(zoomLevel * 100)}%)
+            ⊙ Fit (<span ref={zoomLabelRef}>100%</span>)
           </button>
           <span style={{ fontSize: 11, color: '#94A3B8', marginLeft: 2 }}>• Drag to move</span>
         </div>
@@ -464,4 +370,4 @@ const OntologyGraph = forwardRef(function OntologyGraph(
   );
 });
 
-export default OntologyGraph;
+export default memo(OntologyGraph);

@@ -20,15 +20,32 @@ export function useOntologyExplorer(initialFilters = {}) {
   const [graph, setGraph] = useState({ nodes: [], links: [] });
   const [rootNode, setRootNode] = useState(null);
   const [expandedNodeIds, setExpandedIds] = useState(new Set());
-  const [isLoading, setIsLoading] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
+  const [isLoadingGraph, setIsLoadingGraph] = useState(false);
+  const isLoading = isSearching || isLoadingGraph;
   const [selectedNode, setSelectedNode] = useState(null);
   const [filters, setFilters] = useState(initialFilters);
   const searchRequestId = useRef(0);
   const graphEpoch = useRef(0);
+  const searchController = useRef(null);
+  const graphControllers = useRef(new Map());
+
+  const abortGraphRequests = useCallback(() => {
+    graphEpoch.current++;
+    graphControllers.current.forEach(controller => controller.abort());
+    graphControllers.current.clear();
+  }, []);
+
+  useEffect(() => () => {
+    searchRequestId.current++;
+    searchController.current?.abort();
+    abortGraphRequests();
+  }, [abortGraphRequests]);
 
   const clearExplorer = useCallback(() => {
     searchRequestId.current++;
-    graphEpoch.current++;
+    searchController.current?.abort();
+    abortGraphRequests();
     setSearchQuery('');
     setSearchResults([]);
     setPendingGraphRoot(null);
@@ -36,35 +53,43 @@ export function useOntologyExplorer(initialFilters = {}) {
     setRootNode(null);
     setExpandedIds(new Set());
     setSelectedNode(null);
-    setIsLoading(false);
-  }, []);
+    setIsSearching(false);
+    setIsLoadingGraph(false);
+  }, [abortGraphRequests]);
 
   // Debounced search watcher
   useEffect(() => {
     const requestId = ++searchRequestId.current;
+    searchController.current?.abort();
+    setIsSearching(false);
     if (!searchQuery.trim()) {
       setSearchResults([]);
       setPendingGraphRoot(null);
       return;
     }
 
+    const controller = new AbortController();
+    searchController.current = controller;
     const timer = setTimeout(() => {
-      handleSearch(searchQuery.trim(), requestId);
+      handleSearch(searchQuery.trim(), requestId, controller.signal);
     }, 300);
 
-    return () => clearTimeout(timer);
-  }, [searchQuery, filters]);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [searchQuery]);
 
   // Step 1: Search nodes
-  const handleSearch = useCallback(async (query, requestId) => {
+  const handleSearch = useCallback(async (query, requestId, signal) => {
     if (!query) return;
-    setIsLoading(true);
+    setIsSearching(true);
     try {
       const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}`, {
         credentials: 'include',
+        signal,
       });
-      const results = (await parseJsonSafe(res)) || [];
-      if (requestId !== searchRequestId.current) return;
+      if (!res.ok) throw new Error(`Search failed (${res.status})`);
+      const data = await parseJsonSafe(res);
+      const results = Array.isArray(data) ? data : [];
+      if (signal.aborted || requestId !== searchRequestId.current) return;
       setSearchResults(results);
       if (results.length > 0) {
         setPendingGraphRoot(results[0].id);
@@ -72,12 +97,12 @@ export function useOntologyExplorer(initialFilters = {}) {
         setPendingGraphRoot(null);
       }
     } catch (err) {
-      if (requestId !== searchRequestId.current) return;
+      if (signal.aborted || requestId !== searchRequestId.current) return;
       console.error('Search failed:', err);
       setSearchResults([]);
       setPendingGraphRoot(null);
     } finally {
-      if (requestId === searchRequestId.current) setIsLoading(false);
+      if (requestId === searchRequestId.current) setIsSearching(false);
     }
   }, []);
 
@@ -103,7 +128,7 @@ export function useOntologyExplorer(initialFilters = {}) {
       currentGraph.links.map((l) => {
         const s = typeof l.source === 'object' ? l.source.id : l.source;
         const t = typeof l.target === 'object' ? l.target.id : l.target;
-        return `${s}->${t}`;
+        return JSON.stringify([s, t, l.type]);
       })
     );
 
@@ -111,7 +136,7 @@ export function useOntologyExplorer(initialFilters = {}) {
     newLinks.forEach((link) => {
       const s = typeof link.source === 'object' ? link.source.id : link.source;
       const t = typeof link.target === 'object' ? link.target.id : link.target;
-      const key = `${s}->${t}`;
+      const key = JSON.stringify([s, t, link.type]);
       if (!existingLinkKeys.has(key)) {
         existingLinkKeys.add(key);
         mergedLinks.push(link);
@@ -121,113 +146,72 @@ export function useOntologyExplorer(initialFilters = {}) {
     return { nodes: mergedNodes, links: mergedLinks };
   }, []);
 
-  // Step 3: User clicks "Generate Knowledge Graph"
-  const generateKnowledgeGraph = useCallback(async () => {
-    if (!pendingGraphRoot) return;
-    const targetRoot = pendingGraphRoot;
-    const epoch = graphEpoch.current;
-
-    // Clear search results and pending root
-    setSearchResults([]);
-    setPendingGraphRoot(null);
-    setSearchQuery('');
-    setSelectedNode(null);
-    setRootNode(targetRoot);
-    setIsLoading(true);
-
-    try {
-      const res = await fetch(`${API_BASE}/expand/${encodeURIComponent(targetRoot)}`, {
-        credentials: 'include',
-      });
-      const data = await parseJsonSafe(res);
-      if (epoch !== graphEpoch.current) return;
-
-      if (data && data.nodes && data.nodes.length > 0) {
-        setGraph(data);
-        setExpandedIds(new Set([targetRoot]));
-      } else {
-        // Fallback root
-        setGraph({
-          nodes: [{ id: targetRoot, label: targetRoot, type: 'Employee' }],
-          links: [],
-        });
-        setExpandedIds(new Set([targetRoot]));
-      }
-    } catch (err) {
-      if (epoch !== graphEpoch.current) return;
-      console.error('Failed to generate graph:', err);
-      setGraph({
-        nodes: [{ id: targetRoot, label: targetRoot, type: 'Employee' }],
-        links: [],
-      });
-      setExpandedIds(new Set([targetRoot]));
-    } finally {
-      if (epoch === graphEpoch.current) setIsLoading(false);
-    }
-  }, [pendingGraphRoot]);
-
-  // Load a graph directly (e.g. from filter selection)
+  // A new root cancels every request for the previous graph.
   const loadGraph = useCallback(async (rootId) => {
     if (!rootId) return;
+    abortGraphRequests();
     const epoch = graphEpoch.current;
+    const controller = new AbortController();
+    graphControllers.current.set(rootId, controller);
     setRootNode(rootId);
     setSelectedNode(null);
     setSearchResults([]);
     setPendingGraphRoot(null);
-    setIsLoading(true);
-
+    setSearchQuery('');
+    setGraph({ nodes: [], links: [] });
+    setExpandedIds(new Set());
+    setIsLoadingGraph(true);
     try {
       const res = await fetch(`${API_BASE}/expand/${encodeURIComponent(rootId)}`, {
-        credentials: 'include',
+        credentials: 'include', signal: controller.signal,
       });
+      if (!res.ok) throw new Error(`Graph request failed (${res.status})`);
       const data = await parseJsonSafe(res);
-      if (epoch !== graphEpoch.current) return;
-
-      if (data && data.nodes && data.nodes.length > 0) {
-        setGraph(data);
-        setExpandedIds(new Set([rootId]));
-      } else {
-        setGraph({
-          nodes: [{ id: rootId, label: rootId, type: 'Employee' }],
-          links: [],
-        });
-        setExpandedIds(new Set([rootId]));
-      }
-    } catch (err) {
-      if (epoch !== graphEpoch.current) return;
-      console.error('Failed to load graph:', err);
+      if (controller.signal.aborted || epoch !== graphEpoch.current) return;
+      setGraph(data?.nodes?.length ? data : {
+        nodes: [{ id: rootId, label: rootId, type: 'Employee' }], links: [],
+      });
+      setExpandedIds(new Set([rootId]));
+    } catch (error) {
+      if (!controller.signal.aborted && epoch === graphEpoch.current) console.error('Failed to load graph:', error);
     } finally {
-      if (epoch === graphEpoch.current) setIsLoading(false);
+      if (epoch === graphEpoch.current) {
+        graphControllers.current.delete(rootId);
+        setIsLoadingGraph(graphControllers.current.size > 0);
+      }
     }
-  }, []);
+  }, [abortGraphRequests]);
 
-  // Step 4: Expand a non-root node
-  const expandNodeInGraph = useCallback(async (node) => {
+  const generateKnowledgeGraph = useCallback(() => {
+    if (pendingGraphRoot) return loadGraph(pendingGraphRoot);
+  }, [pendingGraphRoot, loadGraph]);
+
+  // Repeated clicks on a node share the request already in flight.
+  const expandNodeInGraph = useCallback(async node => {
     const nodeId = typeof node === 'object' ? node.id : node;
-    if (!nodeId) return;
+    if (!nodeId || graphControllers.current.has(nodeId)) return;
     const epoch = graphEpoch.current;
-
-    setIsLoading(true);
+    const controller = new AbortController();
+    graphControllers.current.set(nodeId, controller);
+    setIsLoadingGraph(true);
     try {
       const res = await fetch(`${API_BASE}/expand/${encodeURIComponent(nodeId)}`, {
-        credentials: 'include',
+        credentials: 'include', signal: controller.signal,
       });
+      if (!res.ok) throw new Error(`Graph request failed (${res.status})`);
       const data = await parseJsonSafe(res);
-      if (epoch !== graphEpoch.current) return;
-
+      if (controller.signal.aborted || epoch !== graphEpoch.current) return;
       if (data && (data.nodes || data.links)) {
-        setGraph((prev) => mergeGraphs(prev, data.nodes || [], data.links || []));
-        setExpandedIds((prev) => {
-          const next = new Set(prev);
-          next.add(nodeId);
-          return next;
-        });
+        setGraph(previous => mergeGraphs(previous, data.nodes || [], data.links || []));
+        setExpandedIds(previous => new Set([...previous, nodeId]));
       }
-    } catch (err) {
-      if (epoch !== graphEpoch.current) return;
-      console.error('Expand node error:', err);
+    } catch (error) {
+      if (!controller.signal.aborted && epoch === graphEpoch.current) console.error('Expand node error:', error);
     } finally {
-      if (epoch === graphEpoch.current) setIsLoading(false);
+      if (epoch === graphEpoch.current) {
+        graphControllers.current.delete(nodeId);
+        setIsLoadingGraph(graphControllers.current.size > 0);
+      }
     }
   }, [mergeGraphs]);
 
@@ -252,8 +236,8 @@ export function useOntologyExplorer(initialFilters = {}) {
       // 2. BFS from the collapsed node to find all its descendants
       const descendants = new Set();
       const queue = [...(adj.get(nodeId) || [])];
-      while (queue.length > 0) {
-        const curr = queue.shift();
+      for (let index = 0; index < queue.length; index++) {
+        const curr = queue[index];
         if (!descendants.has(curr) && curr !== nodeId && curr !== rootNode) {
           descendants.add(curr);
           (adj.get(curr) || []).forEach((nbr) => {
@@ -270,8 +254,8 @@ export function useOntologyExplorer(initialFilters = {}) {
         const rQueue = [rootNode];
         reachableFromRootWithoutNode.add(rootNode);
 
-        while (rQueue.length > 0) {
-          const curr = rQueue.shift();
+        for (let index = 0; index < rQueue.length; index++) {
+          const curr = rQueue[index];
           (adj.get(curr) || []).forEach((nbr) => {
             if (nbr !== nodeId && !reachableFromRootWithoutNode.has(nbr)) {
               reachableFromRootWithoutNode.add(nbr);

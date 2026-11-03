@@ -98,6 +98,26 @@ If signup displays an account-service error with HTTP 404, inspect `/api/healthz
 
 Reference: [Vercel external rewrites](https://vercel.com/docs/routing/rewrites).
 
+## Application and graph performance
+
+The application refreshes employees, jobs and alerts once per refresh cycle, in parallel. Refreshes do not overlap, pause while the browser tab is hidden, and resume when it becomes visible. Switching application tabs reuses loaded data. Identical responses retain React state so they do not trigger another full render. Automatic alerts still refresh every eight seconds after the previous refresh finishes while the tab is visible.
+
+The graph loads its renderer on demand, reuses SVG nodes and edges during expansion, and computes the tree layout in linear time without recursive subtree scans. Dragging updates only incident edges on animation frames, without measuring text. Larger graphs skip node shadows and hide relationship labels when zoomed out. A new root cancels old graph requests; repeated expansion clicks share one pending request. Search and filter requests are debounced and cancelled when replaced.
+
+Flask keeps one Neo4j driver and connection pool per worker process, with a separate short-lived session for each operation. Filter facets use one graph query instead of seven; graph expansion reads the root and its neighbors in one query and uses sets to deduplicate results. MongoDB remains authoritative for employee changes.
+
+Verify changes locally:
+
+```bash
+node --test src/deploymentStatuses.test.mjs src/graphLayout.test.mjs src/polling.test.mjs
+.venv/bin/python -m unittest backend.test_employee_persistence backend.test_neo4j_pool -v
+npm run build:vercel
+```
+
+Commit and push both the frontend and backend changes, then wait for **both Vercel and Render** to redeploy. A frontend-only redeploy does not apply the connection-pool and query improvements. No new environment variables are required.
+
+For faster first visits after inactivity, an always-running backend is the next hosting improvement. [Render Free web services sleep after 15 minutes without inbound traffic and take about one minute to wake](https://render.com/docs/free#spinning-down-on-idle). Application rendering changes cannot remove that startup delay. Keep the backend and databases geographically close when choosing hosting regions.
+
 ## GitHub Pages frontend
 
 The workflow in [.github/workflows/deploy-pages.yml](.github/workflows/deploy-pages.yml) builds and publishes the frontend on pushes to `main`, or when run manually from the Actions tab. The Pages build uses `/Talentlens/` as its asset base; regular builds and local development use `/`.

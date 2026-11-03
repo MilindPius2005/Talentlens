@@ -6,16 +6,17 @@ import pandas as pd
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
-from neo4j import GraphDatabase
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from gridfs import GridFS
 
 if __package__:
+    from .neo4j_pool import Neo4jPool
     from .employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
                                  sync_employees, public_employee, repair_softblocked_deployment_status)
 else:
+    from neo4j_pool import Neo4jPool
     from employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
                                 sync_employees, public_employee, repair_softblocked_deployment_status)
 
@@ -43,14 +44,10 @@ NEO4J_DATABASE = os.getenv('NEO4J_DATABASE', 'neo4j')
 SOFTBLOCK_DAYS = 15
 REQUIRED_COLUMNS = ['Emp_Name', 'Client_Name', 'Skills', 'misc skill']
 NODE_COLUMNS = {'emp_name', 'client_name', 'project', 'skills', 'misc skill', 'module', 'domain', 'skillgroup', 'level', 'kpmg_level', 'location'}
+neo4j_pool = Neo4jPool()
 
 def get_neo4j_driver():
-    return GraphDatabase.driver(
-        NEO4J_URI,
-        auth=(NEO4J_USER, NEO4J_PASSWORD),
-        connection_timeout=5,
-        max_transaction_retry_time=5
-    )
+    return neo4j_pool.acquire(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
 
 @app.after_request
 def after_request(response):
@@ -228,39 +225,36 @@ def get_filter_options():
     try:
         with get_neo4j_driver() as driver:
             with driver.session(database=NEO4J_DATABASE) as session:
-                res = session.run("MATCH (s:Skill) RETURN DISTINCT s.name as name")
-                options['skills'] = sorted([r['name'] for r in res if r['name']])
-                res = session.run("MATCH (c:Client) RETURN DISTINCT c.name as name")
-                options['clients'] = sorted([
-                    r['name'] for r in res
-                    if r['name'] and normalize_optional_text(r['name'])
-                ])
-                res = session.run("""
-                    MATCH (e:Employee)
-                    WHERE NOT e.name IN $managed_names
-                    RETURN DISTINCT CASE WHEN toUpper(e.status) = 'SOFTBLOCKED'
-                        THEN 'SOFTBLOCKED' ELSE coalesce(
-                        e.deployment_status,
-                        e.status
-                    ) END as status
-                """, managed_names=managed_names)
-                options['deploymentStatuses'] = sorted([
-                    status.upper() for r in res
-                    if (status := normalize_optional_text(r['status']))
-                ])
-                res = session.run("MATCH (l:Location) RETURN DISTINCT l.name as name")
-                options['locations'] = sorted([r['name'] for r in res if r['name']])
-                res = session.run("MATCH (d:Domain) RETURN DISTINCT d.name as name")
-                options['domains'] = sorted([r['name'] for r in res if r['name']])
-                res = session.run("MATCH (d:Level) RETURN DISTINCT d.name as name")
-                options['levels'] = sorted([r['name'] for r in res if r['name']])
-                res = session.run("MATCH (e:Employee) WHERE e.available_since IS NOT NULL RETURN min(e.available_since) as oldest")
-                record = res.single()
-                if record and record['oldest']:
-                    oldest_date = datetime.strptime(record['oldest'], '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                    options['benchMax'] = (datetime.now(timezone.utc) - oldest_date).days
-                else:
-                    options['benchMax'] = 365
+                # Fetch all filter facets in one database round trip.
+                record = session.run("""
+                    CALL { MATCH (s:Skill) RETURN collect(DISTINCT s.name) AS skills }
+                    CALL { MATCH (c:Client) RETURN collect(DISTINCT c.name) AS clients }
+                    CALL {
+                        MATCH (e:Employee) WHERE NOT e.name IN $managed_names
+                        RETURN collect(DISTINCT CASE WHEN toUpper(e.status) = 'SOFTBLOCKED'
+                            THEN 'SOFTBLOCKED' ELSE coalesce(e.deployment_status, e.status)
+                        END) AS statuses
+                    }
+                    CALL { MATCH (l:Location) RETURN collect(DISTINCT l.name) AS locations }
+                    CALL { MATCH (d:Domain) RETURN collect(DISTINCT d.name) AS domains }
+                    CALL { MATCH (l:Level) RETURN collect(DISTINCT l.name) AS levels }
+                    CALL {
+                        MATCH (e:Employee) WHERE e.available_since IS NOT NULL
+                        RETURN min(e.available_since) AS oldest
+                    }
+                    RETURN skills, clients, statuses, locations, domains, levels, oldest
+                """, managed_names=managed_names).single()
+                if record:
+                    for key in ('skills', 'clients', 'locations', 'domains', 'levels'):
+                        options[key] = sorted(value for value in record[key] if normalize_optional_text(value))
+                    options['deploymentStatuses'] = sorted(
+                        value.upper() for value in record['statuses'] if normalize_optional_text(value)
+                    )
+                    if record['oldest']:
+                        oldest_date = datetime.strptime(record['oldest'], '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                        options['benchMax'] = (datetime.now(timezone.utc) - oldest_date).days
+                    else:
+                        options['benchMax'] = 365
     except Exception as e:
         print(f"Error fetching filter options from Neo4j: {e}")
 
@@ -983,19 +977,30 @@ def expand_node(node):
     try:
         with get_neo4j_driver() as driver:
             with driver.session(database=NEO4J_DATABASE) as session:
-                root_res = session.run("MATCH (n {name: $node}) RETURN n", node=node)
-                root_rec = root_res.single()
-                if root_rec:
-                    nodes.append(graph_node(root_rec['n']))
-
-                res = session.run("MATCH (n {name: $node})-[r]-(m) RETURN n, r, m", node=node)
+                res = session.run("""
+                    MATCH (n {name: $node})
+                    OPTIONAL MATCH (n)-[r]-(m)
+                    RETURN n, r, m
+                """, node=node)
+                seen_node_ids = set()
+                seen_edges = set()
                 for rec in res:
                     n = rec['n']; m = rec['m']; r = rec['r']
                     n_id = n.get('id', n.get('name'))
+                    if n_id not in seen_node_ids:
+                        nodes.append(graph_node(n))
+                        seen_node_ids.add(n_id)
+                    if m is None or r is None:
+                        continue
                     m_id = m.get('id', m.get('name'))
-                    if not any(d['id'] == n_id for d in nodes): nodes.append(graph_node(n))
-                    if not any(d['id'] == m_id for d in nodes): nodes.append(graph_node(m))
-                    links.append({'source': n_id if r.nodes[0] == n else m_id, 'target': m_id if r.nodes[0] == n else n_id, 'type': r.type})
+                    if m_id not in seen_node_ids:
+                        nodes.append(graph_node(m))
+                        seen_node_ids.add(m_id)
+                    source, target = (n_id, m_id) if r.nodes[0] == n else (m_id, n_id)
+                    edge_key = (source, target, r.type)
+                    if edge_key not in seen_edges:
+                        links.append({'source': source, 'target': target, 'type': r.type})
+                        seen_edges.add(edge_key)
     except Exception as e:
         print(f"Expand Neo4j error: {e}")
 
@@ -1010,6 +1015,7 @@ def expand_node(node):
                           'HAS_DOMAIN', 'HAS_LOCATION', 'HAS_LEVEL', 'WORKS_ON'}
     links = [link for link in links if not (
         link['source'] in managed and link['type'] in imported_relations)]
+    link_keys = {(link['source'], link['target'], link['type']) for link in links}
     node_map = {entry['id']: entry for entry in nodes}
     for rec in records:
         name = rec.get('emp_name')
@@ -1032,8 +1038,10 @@ def expand_node(node):
                     node_map[employee_id] = {'id': employee_id, 'label': name, 'type': 'Employee'}
                     node_map[value] = {'id': value, 'label': value, 'type': label}
                     edge = {'source': employee_id, 'target': value, 'type': relation}
-                    if edge not in links:
+                    edge_key = (employee_id, value, relation)
+                    if edge_key not in link_keys:
                         links.append(edge)
+                        link_keys.add(edge_key)
         if is_root:
             node_map[employee_id] = {'id': employee_id, 'label': name, 'type': 'Employee'}
     for entry in node_map.values():
