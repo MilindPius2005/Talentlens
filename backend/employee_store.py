@@ -9,6 +9,11 @@ from uuid import uuid4
 from pymongo import ReturnDocument
 from pymongo.errors import CollectionInvalid
 
+if __package__:
+    from .location_store import normalize_locations
+else:
+    from location_store import normalize_locations
+
 
 LIST_FIELDS = ('skills', 'misc_skills', 'domain', 'location', 'level')
 TEXT_FIELDS = (
@@ -63,6 +68,7 @@ def save_import(db, records, owner, upload_id):
             if not fields.get('deployment_status'):
                 fields['deployment_status'] = 'AVAILABLE'
         fields.update({key: record.get(key, []) for key in LIST_FIELDS})
+        fields['location'] = normalize_locations(fields['location'])
         existing = db['employees'].find_one({'emp_name': record['emp_name']}, {'status': 1})
         if (existing or record).get('status') == 'SOFTBLOCKED':
             fields['deployment_status'] = 'SOFTBLOCKED'
@@ -85,6 +91,8 @@ def find_employee(db, identifier):
 
 
 def update_employee(db, identifier, changes):
+    if 'location' in changes:
+        changes = {**changes, 'location': normalize_locations(changes['location'])}
     ensure_employee_schema(db)
     return db['employees'].find_one_and_update(
         {'$or': [{'id': identifier}, {'emp_name': identifier}]},

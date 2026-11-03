@@ -12,11 +12,13 @@ from dotenv import load_dotenv
 from gridfs import GridFS
 
 if __package__:
+    from .location_store import normalize_location
     from .company_store import company_context, graph_node_is_current, normalize_company_name, prune_orphan_clients, prune_orphan_job_locations
     from .neo4j_pool import Neo4jPool
     from .employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
                                  sync_employees, public_employee, repair_softblocked_deployment_status)
 else:
+    from location_store import normalize_location
     from company_store import company_context, graph_node_is_current, normalize_company_name, prune_orphan_clients, prune_orphan_job_locations
     from neo4j_pool import Neo4jPool
     from employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
@@ -293,7 +295,7 @@ def get_employees():
     bench_min = request.args.get('benchMin', type=int)
     bench_max = request.args.get('benchMax', type=int)
     client = request.args.get('client')
-    location = request.args.get('location')
+    location = normalize_location(request.args.get('location'))
     domain = request.args.get('domain')
     status = request.args.get('status')
     level = request.args.get('level')
@@ -386,7 +388,8 @@ def get_employees():
                         'available_since': emp.get('available_since'),
                         'bench_aging': bench_days,
                         'location': emp.get('location') or related_locations,
-                        'locations': emp.get('location') if isinstance(emp.get('location'), list) else related_locations,
+                        'locations': (emp.get('location') if isinstance(emp.get('location'), list)
+                                      else [emp['location']] if emp.get('location') else related_locations),
                         'skills': emp.get('skills', []),
                         'softblock_job': emp.get('softblock_job'),
                         'softblock_company': emp.get('softblock_company'),
@@ -716,7 +719,7 @@ def add_job():
         'id': uuid.uuid4().hex,
         'role': role,
         'client': str(data.get('client') or '').strip(),
-        'location': str(data.get('location') or '').strip(),
+        'location': normalize_location(data.get('location')),
         'status': 'OPEN',
         'open_date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
         'description': str(data.get('description') or '').strip(),

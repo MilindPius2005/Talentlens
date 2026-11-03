@@ -180,6 +180,17 @@ class EmployeePersistenceTests(unittest.TestCase):
         self.upload(b'Emp_Name,Client_Name,Skills,misc skill,Employee_Location\nAlice,Acme,Python,SQL,Hyderabad\n')
         self.assertEqual(find_employee(self.db, 'Alice')['location'], ['Hyderabad'])
 
+    def test_bangalore_spellings_are_stored_once_as_bengaluru(self):
+        self.offline()
+        self.upload(b'Emp_Name,Client_Name,Skills,misc skill,Location\nAlice,Acme,Python,SQL,"Bangalore, Bengaluru, Banglore"\nBob,Acme,Python,SQL,Chennai\n')
+        self.assertEqual(find_employee(self.db, 'Alice')['location'], ['Bengaluru'])
+        self.assertEqual(self.client.get('/filter-options').json['locations'], ['Bengaluru', 'Chennai'])
+        self.assertEqual(self.client.get('/employees?location=Bangalore').json[0]['name'], 'Alice')
+        self.client.put('/employees/Alice', json={'location': [' Bangalore ', 'Bengaluru', 'Pune']})
+        self.assertEqual(find_employee(self.db, 'Alice')['location'], ['Bengaluru', 'Pune'])
+        job = self.client.post('/jobs', json={'role': 'Engineer', 'client': 'Acme', 'location': 'Banglore'}).json['job']
+        self.assertEqual(job['location'], 'Bengaluru')
+
     def test_upload_offline_stays_available_and_retry_syncs(self):
         self.offline()
         response = self.upload()

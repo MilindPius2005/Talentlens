@@ -1,4 +1,4 @@
-import { getEmployeeLocations } from './employeeLocations.js';
+import { getEmployeeLocations, getLocationValues } from './employeeLocations.js';
 
 function companyName(value) {
   if (typeof value !== 'string') return null;
@@ -14,7 +14,7 @@ export function getCurrentCompanies(employees = [], jobs = []) {
 }
 
 export function getReferencedLocations(employees = [], jobs = []) {
-  return [...new Set([...employees.flatMap(getEmployeeLocations), ...jobs.map(job => job.location?.trim()).filter(Boolean)])];
+  return getLocationValues([...employees.flatMap(getEmployeeLocations), ...jobs.map(job => job.location).filter(Boolean)]);
 }
 
 export function pruneDeletedJobNodes(graph, companies, jobs, employees = []) {

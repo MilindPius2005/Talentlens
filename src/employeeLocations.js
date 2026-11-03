@@ -1,6 +1,11 @@
+export function normalizeLocation(value) {
+  const name = value.trim();
+  return ['bangalore', 'banglore', 'bengaluru'].includes(name.toLowerCase()) ? 'Bengaluru' : name;
+}
+
 export function getLocationValues(value) {
   const values = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/[,;\n]/) : [];
-  return [...new Set(values.filter(item => typeof item === 'string').map(item => item.trim())
+  return [...new Set(values.filter(item => typeof item === 'string').map(normalizeLocation)
     .filter(item => item && !['na', 'n/a', 'none', 'null', 'nan'].includes(item.toLowerCase())))];
 }
 
