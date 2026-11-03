@@ -1165,7 +1165,10 @@ def upload_file():
             'skills': parse_skills(row.get('Skills')),
             'misc_skills': parse_skills(row.get('misc skill')),
             'domain': parse_skills(row.get('Domain')) if 'Domain' in df.columns else [],
-            'location': parse_skills(row.get('Location')) if 'Location' in df.columns else [],
+            'location': parse_skills(get_ingested_value(row, [
+                'Location', 'Locations', 'Employee Location', 'Current Location',
+                'Base Location', 'Office Location', 'Work Location', 'City',
+            ])),
             'level': [],
             'available_since': emp_available_since
         }

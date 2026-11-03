@@ -148,6 +148,36 @@ class EmployeePersistenceTests(unittest.TestCase):
         # All employee and relationship writes use the same Neo4j transaction.
         self.assertEqual(self.session.execute_write.call_count, 1)
 
+    def test_lowercase_location_import_is_saved_and_filterable_offline(self):
+        self.offline()
+        response = self.upload(b'Emp_Name,Client_Name,Skills,misc skill,location\nAlice,Acme,Python,SQL,"Pune, Remote"\nBob,Acme,Python,SQL,Chennai\n')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(find_employee(self.db, 'Alice')['location'], ['Pune', 'Remote'])
+        self.assertEqual(self.client.get('/filter-options').json['locations'], ['Chennai', 'Pune', 'Remote'])
+        response = self.client.get('/employees?location=Pune&skills=Python,SQL')
+        self.assertEqual([employee['name'] for employee in response.json], ['Alice'])
+        self.assertEqual(response.json[0]['locations'], ['Pune', 'Remote'])
+        self.assertEqual(self.client.get('/employees?location=Remote').json[0]['name'], 'Alice')
+        self.assertEqual(self.client.get('/employees?location=Mumbai').json, [])
+
+    def test_location_edit_persists_and_retry_projects_latest_locations(self):
+        self.upload()
+        self.offline()
+        response = self.client.put('/employees/Alice', json={'location': [' Pune ', 'Remote', 'Pune']})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(find_employee(self.db, 'Alice')['location'], ['Pune', 'Remote'])
+        self.assertEqual(response.json['employee']['locations'], ['Pune', 'Remote'])
+        self.assertTrue(response.json['neo4j_pending'])
+        self.assertEqual(self.client.get('/employees?location=London').json, [])
+        self.assertEqual(self.client.get('/filter-options').json['locations'], ['Pune', 'Remote'])
+        self.online()
+        self.client.post('/ingestion/sync-pending')
+        self.assertEqual(self.projected[-1]['location'], ['Pune', 'Remote'])
+
+    def test_location_column_alias_is_mapped_to_permanent_employee(self):
+        self.upload(b'Emp_Name,Client_Name,Skills,misc skill,Employee_Location\nAlice,Acme,Python,SQL,Hyderabad\n')
+        self.assertEqual(find_employee(self.db, 'Alice')['location'], ['Hyderabad'])
+
     def test_upload_offline_stays_available_and_retry_syncs(self):
         self.offline()
         response = self.upload()

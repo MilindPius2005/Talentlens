@@ -171,6 +171,7 @@ def public_employee(employee):
         result['deployment_status'] = 'AVAILABLE'
     result['name'] = employee['emp_name']
     result['neo4j_pending'] = not employee.get('neo4j_synced', False)
+    result['locations'] = employee.get('location', [])
     result['location'] = ', '.join(employee.get('location', [])) or None
     result['skills'] = [{'name': name, 'proficiency': 3}
                         for name in dict.fromkeys(employee.get('skills', []) + employee.get('misc_skills', []))]

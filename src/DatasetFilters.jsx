@@ -1,21 +1,24 @@
 import React, { useState, useEffect } from 'react';
 import './index.css';
 import { getDeploymentStatuses } from './deploymentStatuses';
+import { getLocationOptions } from './employeeLocations';
 
 export default function DatasetFilters({ onFilterChange, API_BASE, employees = [] }) {
   const [options, setOptions] = useState({
-    clients: [], skills: [], levels: [],
+    clients: [], skills: [], levels: [], locations: [],
     deploymentStatuses: [], benchMin: 0, benchMax: 365
   });
 
   const [benchRange, setBenchRange] = useState({ min: 0, max: 365 });
   const [filters, setFilters] = useState({
     client: "",
+    location: "",
     status: "",
     level: "",
     skills: []
   });
   const deploymentStatuses = getDeploymentStatuses(employees, options.deploymentStatuses || []);
+  const locations = getLocationOptions(employees, options.locations || []);
 
   useEffect(() => {
     fetch(`${API_BASE}/filter-options`, { credentials: "include" })
@@ -67,6 +70,7 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
   const handleReset = () => {
     const emptyFilters = {
       client: "",
+      location: "",
       status: "",
       level: "",
       skills: []
@@ -104,6 +108,14 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
       </div>
 
       <div>
+        <label className="form-label" htmlFor="employee-location-filter" style={{ display: 'block', marginBottom: 8 }}>Location</label>
+        <select id="employee-location-filter" className="form-input" value={filters.location} onChange={event => handleChange('location', event.target.value)}>
+          <option value="">All Locations</option>
+          {locations.map(location => <option key={location} value={location}>{location}</option>)}
+        </select>
+      </div>
+
+      <div>
         <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Deployment Status</label>
         <select className="form-input" value={filters.status} onChange={e => handleChange('status', e.target.value)}>
           <option value="">All Statuses</option>
@@ -114,9 +126,9 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
       </div>
 
       <div>
-        <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Campus / Lateral (Level)</label>
-        <select className="form-input" value={filters.level} onChange={e => handleChange('level', e.target.value)}>
-          <option value="">All Levels</option>
+        <label className="form-label" htmlFor="employee-designation-filter" style={{ display: "block", marginBottom: 8 }}>Designation</label>
+        <select id="employee-designation-filter" className="form-input" value={filters.level} onChange={e => handleChange('level', e.target.value)}>
+          <option value="">All Designations</option>
           {options.levels.map(l => <option key={l} value={l}>{l}</option>)}
         </select>
       </div>

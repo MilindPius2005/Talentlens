@@ -8,6 +8,7 @@ import { getDeploymentStatuses } from './deploymentStatuses';
 import { startPolling, reuseUnchangedRows } from './polling';
 import SoftblockJobFields from './SoftblockJobFields';
 import { isOpenJobSelection } from './openJobs';
+import { getEmployeeLocations, getLocationValues } from './employeeLocations';
 
 const OntologyGraph = lazy(() => import('./OntologyGraph'));
 
@@ -362,7 +363,7 @@ function Employees({ employees, setEmployees, jobs, user, setAlerts, pendingRequ
       <div className="card">
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Name</th><th>Deployment Status</th><th>Bench age</th><th>Skills</th><th>Interviews</th><th>Alert</th></tr></thead>
+            <thead><tr><th>Name</th><th>Deployment Status</th><th>Location</th><th>Bench age</th><th>Skills</th><th>Interviews</th><th>Alert</th></tr></thead>
             <tbody>
               {employees.map(e => {
                 const days = e.status !== "MAPPED" ? daysSince(e.available_since) : 0;
@@ -372,6 +373,7 @@ function Employees({ employees, setEmployees, jobs, user, setAlerts, pendingRequ
                   <tr key={e.id} style={{ cursor:"pointer", background: isPending ? "#FBF3E0" : "transparent" }} onClick={() => setSelected(e)}>
                     <td style={{ fontWeight:600 }}>{e.name} {isPending && <span style={{ fontSize: 10, padding: "2px 6px", background: "#B8710F", color: "#fff", borderRadius: 10, marginLeft: 6 }}>PENDING</span>}</td>
                     <td>{statusBadge(e.deployment_status || e.status)}</td>
+                    <td>{getEmployeeLocations(e).join(', ') || 'Not specified'}</td>
                     <td style={{ minWidth:140 }}><AgingBar days={days} /></td>
                     <td><div className="skill-chips">{e.skills.slice(0,3).map(s => <span key={s.name} className="skill-chip">{s.name} {s.proficiency}</span>)}{e.skills.length > 3 && <span className="skill-chip">+{e.skills.length-3}</span>}</div></td>
                     <td style={{ color: T.muted }}>{e.interviews.length}</td>
@@ -479,6 +481,7 @@ function EmployeeDetail({ emp, jobs, user, onClose, onUpdate, setAlerts }) {
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"start", marginBottom:20 }}>
           <div><div className="modal-title" style={{ marginBottom:4 }}>{emp.name}</div>
             <div style={{ display:"flex", gap:8, alignItems:"center" }}>{statusBadge(emp.status)}<span style={{ fontSize:12, color:T.muted }}>{days} days on bench · since {emp.available_since}</span></div>
+            <div style={{ fontSize: 13, color: T.slate, marginTop: 8 }}>Location: {getEmployeeLocations(emp).join(', ') || 'Not specified'}</div>
           </div>
           <button className="btn btn-ghost btn-sm" onClick={onClose}>✕</button>
         </div>
@@ -1514,7 +1517,7 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
       const res = await fetch(`${API_BASE}/employees/${encodeURIComponent(selectedNode.id)}`, {
         method: "PUT", credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(editingEmployee),
+        body: JSON.stringify({ ...editingEmployee, location: getLocationValues(editingEmployee.location) }),
       });
       const data = await parseJsonSafe(res);
       if (!res.ok || !data?.employee) throw new Error(data?.error || "Unable to save employee");
@@ -1543,6 +1546,7 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
     if (benchRange.min > 0) params.append('benchMin', benchRange.min);
     if (benchRange.max < 365) params.append('benchMax', benchRange.max);
     if (filters.client) params.append('client', filters.client);
+    if (filters.location) params.append('location', filters.location);
     if (filters.level) params.append('level', filters.level);
     if (filters.status) params.append('status', filters.status);
     if (filters.skills && filters.skills.length > 0) params.append('skills', filters.skills.join(','));
@@ -1714,6 +1718,7 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
               <div style={{ marginBottom: 8, fontSize: 13 }}><strong>Deployment:</strong> {selectedNode.deployment_status || "Unspecified"}</div>
               <div style={{ marginBottom: 8, fontSize: 13 }}><strong>Client:</strong> {selectedNode.client_name || "None"}</div>
               <div style={{ marginBottom: 8, fontSize: 13 }}><strong>Project:</strong> {selectedNode.current_project || "None"}</div>
+              <div style={{ marginBottom: 8, fontSize: 13 }}><strong>Location:</strong> {getEmployeeLocations(selectedNode).join(', ') || 'Not specified'}</div>
               {employeeMessage && <div role="status" style={{ fontSize: 13, margin: "12px 0" }}>{employeeMessage}</div>}
               {editingEmployee ? (
                 <form onSubmit={saveEmployee} style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 16 }}>
@@ -1728,6 +1733,9 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
                       <input className="form-input" value={editingEmployee[field]} onChange={e => setEditingEmployee(prev => ({ ...prev, [field]: e.target.value }))} />
                     </label>
                   ))}
+                  <label className="form-label">Location (comma-separated)
+                    <input className="form-input" value={editingEmployee.location} onChange={event => setEditingEmployee(previous => ({ ...previous, location: event.target.value }))} />
+                  </label>
                   <div style={{ display: "flex", gap: 8 }}>
                     <button type="submit" className="btn btn-primary btn-sm" disabled={savingEmployee}>{savingEmployee ? "Saving..." : "Save changes"}</button>
                     <button type="button" className="btn btn-ghost btn-sm" disabled={savingEmployee} onClick={() => setEditingEmployee(null)}>Cancel</button>
@@ -1739,6 +1747,7 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
                   client_name: selectedNode.client_name || "",
                   current_project: selectedNode.current_project || "",
                   performance: selectedNode.performance || "",
+                  location: getEmployeeLocations(selectedNode).join(', '),
                 })}>Edit employee</button>
               )}
               {selectedNode.available_since && (

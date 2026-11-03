@@ -64,6 +64,8 @@ If Neo4j is unavailable, the response reports `neo4j_pending: true`; the employe
 
 Spreadsheet ingestion recognizes optional `Deployment Status`, `Current Project(s)` / `Project(s)`, and `Performance` columns. The deployment filter matches the saved deployment status directly, including imported values such as Training or On Leave and later changes such as Softblocked. Project, client, and performance values do not override this status. The client filter's **No Clients** option includes employees without an assigned client.
 
+The Graph sidebar's **Location** filter uses the current employee locations, with **All Locations** to remove only the location restriction. Employee locations appear in the Employees table and profile, and in the graph details. Use **Graph → Edit employee → Location** to update them; comma-separated locations are saved as a string array in MongoDB and synced to Neo4j. The API returns both a display string in `location` and the complete array in `locations`. Import location headers are matched without regard to case, spaces or underscores, including `Location`, `location`, `Locations`, `Employee Location`, `Current Location`, `Base Location`, `Office Location`, `Work Location` and `City`.
+
 ## Build
 ```bash
 npm run build
