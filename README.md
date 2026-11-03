@@ -56,6 +56,8 @@ Select an employee in **Graph**, then choose **Edit employee** to update deploym
 
 `POST /employees/:id/softblock`, `/release`, and `/snooze` use the same persistence path. Soft-blocking sets both `status` and `deployment_status` to `SOFTBLOCKED`; release sets both to `AVAILABLE`. Re-ingestion preserves active soft-blocks. Older MongoDB soft-block records with a stale deployment status are repaired when read or retried, and marked for Neo4j sync. Employees from older Neo4j-only uploads are copied into MongoDB when first edited. Existing pending employee uploads are migrated on retry.
 
+In the Graph and Employees soft-block forms, **Company Name** lists companies with open jobs from the Jobs tab. **Job Position** lists that company's open roles. Changing the company clears the previous role; deleted or closed jobs disappear on refresh. Choose both fields before confirming. The API receives the selected company name and job position.
+
 If Neo4j is unavailable, the response reports `neo4j_pending: true`; the employee remains saved in MongoDB. Use **Ingestion → Retry graph sync** or authenticated `POST /ingestion/sync-pending` to retry the latest employee state. The sync version prevents an older operation from marking a newer edit synced. Upload history shows pending syncs. No background retry worker is configured.
 
 `POST /ingestion/clear` removes ingested employees, stored documents, upload history, and the graph; it retains MongoDB data if Neo4j cannot be cleared. This action requires login and clears the application's shared dataset.

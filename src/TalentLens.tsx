@@ -6,6 +6,8 @@ import SearchBar from './SearchBar';
 import { useOntologyExplorer } from './useOntologyExplorer';
 import { getDeploymentStatuses } from './deploymentStatuses';
 import { startPolling, reuseUnchangedRows } from './polling';
+import SoftblockJobFields from './SoftblockJobFields';
+import { isOpenJobSelection } from './openJobs';
 
 const OntologyGraph = lazy(() => import('./OntologyGraph'));
 
@@ -335,7 +337,7 @@ function Dashboard({ employees, jobs, alerts, user, onLogout }) {
 }
 
 // ─── Employees ────────────────────────────────────────────────────────────────
-function Employees({ employees, setEmployees, user, setAlerts, pendingRequests = [] }) {
+function Employees({ employees, setEmployees, jobs, user, setAlerts, pendingRequests = [] }) {
   const [showAdd, setShowAdd] = useState(false);
   const [selected, setSelected] = useState(null);
   const [form, setForm] = useState({ name:"", status:"AVAILABLE", available_since:"", skills:"" });
@@ -381,7 +383,7 @@ function Employees({ employees, setEmployees, user, setAlerts, pendingRequests =
           </table>
         </div>
       </div>
-      {selected && <EmployeeDetail emp={selected} user={user} setAlerts={setAlerts} onClose={() => setSelected(null)} onUpdate={(updated) => { setEmployees(prev => prev.map(e => e.id === updated.id ? updated : e)); setSelected(updated); }} />}
+      {selected && <EmployeeDetail emp={selected} jobs={jobs} user={user} setAlerts={setAlerts} onClose={() => setSelected(null)} onUpdate={(updated) => { setEmployees(prev => prev.map(e => e.id === updated.id ? updated : e)); setSelected(updated); }} />}
       {showAdd && (
         <div className="modal-overlay" onClick={() => setShowAdd(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
@@ -402,7 +404,7 @@ function Employees({ employees, setEmployees, user, setAlerts, pendingRequests =
   );
 }
 
-function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
+function EmployeeDetail({ emp, jobs, user, onClose, onUpdate, setAlerts }) {
   const [actionLoading, setActionLoading] = useState(false);
   const [showSoftblockForm, setShowSoftblockForm] = useState(false);
   const [sbForm, setSbForm] = useState({ company_name: "", job_position: "" });
@@ -410,6 +412,7 @@ function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
   const days = daysSince(emp.available_since);
 
   async function executeAction(action, payload = {}) {
+    if (action === 'softblock' && !isOpenJobSelection(jobs, payload)) return;
     setActionLoading(true);
     try {
       const res = await fetch(`${API_BASE}/employees/${encodeURIComponent(emp.id)}/${action}`, {
@@ -511,12 +514,9 @@ function EmployeeDetail({ emp, user, onClose, onUpdate, setAlerts }) {
         {showSoftblockForm && (
           <div style={{ padding: 12, background: T.amberL, borderRadius: 8, marginBottom: 16 }}>
             <div style={{ fontWeight: 600, color: T.amber, marginBottom: 8 }}>Soft-block Details</div>
-            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-              <input type="text" className="form-input" placeholder="Company Name" value={sbForm.company_name} onChange={e => setSbForm(prev => ({...prev, company_name: e.target.value}))} />
-              <input type="text" className="form-input" placeholder="Job Position" value={sbForm.job_position} onChange={e => setSbForm(prev => ({...prev, job_position: e.target.value}))} />
-            </div>
+            <SoftblockJobFields jobs={jobs} value={sbForm} onChange={setSbForm} disabled={actionLoading} />
             <div style={{ display: "flex", gap: 8 }}>
-              <button className="btn btn-primary btn-sm" onClick={() => executeAction("softblock", sbForm)} disabled={actionLoading || !sbForm.company_name.trim() || !sbForm.job_position.trim()}>{actionLoading ? "..." : "Submit"}</button>
+              <button className="btn btn-primary btn-sm" onClick={() => executeAction("softblock", sbForm)} disabled={actionLoading || !isOpenJobSelection(jobs, sbForm)}>{actionLoading ? "..." : "Submit"}</button>
               <button className="btn btn-ghost btn-sm" onClick={() => setShowSoftblockForm(false)}>Cancel</button>
             </div>
           </div>
@@ -1437,7 +1437,7 @@ function Ingestion({ user }) {
   );
 }
 
-const GraphView = memo(function GraphView({ user, employees, setEmployees, setAlerts }) {
+const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees, setAlerts }) {
   const {
     searchQuery,
     setSearchQuery,
@@ -1485,6 +1485,7 @@ const GraphView = memo(function GraphView({ user, employees, setEmployees, setAl
     setSelectedNode({ ...node, ...employee });
     setEditingEmployee(null);
     setShowSoftblockForm(false);
+    setSbForm({ company_name: '', job_position: '' });
     setEmployeeMessage("");
     setGraphActionError("");
   }, [employees, setSelectedNode]);
@@ -1576,6 +1577,10 @@ const GraphView = memo(function GraphView({ user, employees, setEmployees, setAl
   }
   async function handleAction(action, empId) {
     if (!user) return alert("Please log in first");
+    if (action === 'softblock' && !isOpenJobSelection(jobs, sbForm)) {
+      setGraphActionError('Select a company and one of its open job positions.');
+      return;
+    }
     const todayStr = new Date().toISOString().split("T")[0];
     setGraphActionLoading(true);
     setGraphActionError('');
@@ -1736,12 +1741,9 @@ const GraphView = memo(function GraphView({ user, employees, setEmployees, setAl
                   showSoftblockForm ? (
                     <div style={{ padding: 12, background: "#FFFBEB", borderRadius: 8 }}>
                       <div style={{ fontWeight: 600, color: "#B8710F", marginBottom: 8 }}>Soft-block Details</div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
-                        <input type="text" className="form-input" placeholder="Company Name" value={sbForm.company_name} onChange={e => setSbForm(prev => ({...prev, company_name: e.target.value}))} />
-                        <input type="text" className="form-input" placeholder="Job Position" value={sbForm.job_position} onChange={e => setSbForm(prev => ({...prev, job_position: e.target.value}))} />
-                      </div>
+                      <SoftblockJobFields jobs={jobs} value={sbForm} onChange={setSbForm} disabled={graphActionLoading} />
                       <div style={{ display: "flex", gap: 8 }}>
-                        <button className="btn btn-primary btn-sm" disabled={graphActionLoading || !sbForm.company_name.trim() || !sbForm.job_position.trim()} onClick={() => handleAction('softblock', selectedNode.id)}>{graphActionLoading ? 'Saving…' : 'Confirm Soft-block'}</button>
+                        <button className="btn btn-primary btn-sm" disabled={graphActionLoading || !isOpenJobSelection(jobs, sbForm)} onClick={() => handleAction('softblock', selectedNode.id)}>{graphActionLoading ? 'Saving…' : 'Confirm Soft-block'}</button>
                         <button className="btn btn-ghost btn-sm" onClick={() => setShowSoftblockForm(false)}>Cancel</button>
                       </div>
                     </div>
@@ -2128,11 +2130,11 @@ export default function TalentLens() {
           </div>
           <div className="page">
             {page === "dashboard" && <Dashboard employees={employees} jobs={jobs} alerts={alerts} user={user} onLogout={handleLogout} />}
-            {page === "employees" && <Employees employees={employees} setEmployees={setEmployees} user={user} setAlerts={setAlerts} />}
+            {page === "employees" && <Employees employees={employees} setEmployees={setEmployees} jobs={jobs} user={user} setAlerts={setAlerts} />}
             {page === "jobs" && <Jobs jobs={jobs} setJobs={setJobs} employees={employees} />}
             {page === "interviews" && <Interviews employees={employees} setEmployees={setEmployees} />}
             {page === "alerts" && <Alerts employees={employees} alerts={alerts} onUnblock={handleUnblockFromAlert} onSnooze={handleSnoozeFromAlert} />}
-            {page === "graph" && <GraphView user={user} employees={employees} setEmployees={setEmployees} setAlerts={setAlerts} />}
+            {page === "graph" && <GraphView user={user} employees={employees} jobs={jobs} setEmployees={setEmployees} setAlerts={setAlerts} />}
             {page === "ingestion" && <Ingestion user={user} />}
           </div>
         </div>
