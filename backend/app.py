@@ -12,10 +12,12 @@ from dotenv import load_dotenv
 from gridfs import GridFS
 
 if __package__:
+    from .company_store import company_context, graph_node_is_current, normalize_company_name, prune_orphan_clients, prune_orphan_job_locations
     from .neo4j_pool import Neo4jPool
     from .employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
                                  sync_employees, public_employee, repair_softblocked_deployment_status)
 else:
+    from company_store import company_context, graph_node_is_current, normalize_company_name, prune_orphan_clients, prune_orphan_job_locations
     from neo4j_pool import Neo4jPool
     from employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
                                 sync_employees, public_employee, repair_softblocked_deployment_status)
@@ -169,11 +171,11 @@ def employee_record_batches():
         yield {**job, 'records': records}
 
 
-def get_pending_queue_data():
+def get_pending_queue_data(batches=None):
     """Aggregate current MongoDB employees and legacy queued imports."""
     result = {'skills': set(), 'clients': set(), 'locations': set(), 'domains': set(), 'levels': set(), 'deployment_statuses': set(), 'employees': []}
     try:
-        for job in employee_record_batches():
+        for job in employee_record_batches() if batches is None else batches:
             for rec in job.get('records', []):
                 deployment_status = effective_deployment_status(rec)
                 if deployment_status:
@@ -216,7 +218,9 @@ def get_filter_options():
     user = get_current_user()
     if not user:
         return jsonify({"error": "Unauthorized"}), 401
-    managed_names = [employee['emp_name'] for employee in mongo_db['employees'].find({}, {'emp_name': 1})]
+    batches = list(employee_record_batches())
+    context = company_context(mongo_db, [record for batch in batches for record in batch['records']])
+    managed_names = context['managed_names']
     
     options = {
         'clients': [], 'locations': [], 'domains': [], 'skills': [], 'levels': [], 'deploymentStatuses': [],
@@ -228,14 +232,22 @@ def get_filter_options():
                 # Fetch all filter facets in one database round trip.
                 record = session.run("""
                     CALL { MATCH (s:Skill) RETURN collect(DISTINCT s.name) AS skills }
-                    CALL { MATCH (c:Client) RETURN collect(DISTINCT c.name) AS clients }
+                    CALL {
+                        MATCH (e:Employee)-[:WORKED_FOR]->(c:Client)
+                        WHERE NOT e.name IN $managed_names
+                        RETURN collect(DISTINCT c.name) AS clients
+                    }
                     CALL {
                         MATCH (e:Employee) WHERE NOT e.name IN $managed_names
                         RETURN collect(DISTINCT CASE WHEN toUpper(e.status) = 'SOFTBLOCKED'
                             THEN 'SOFTBLOCKED' ELSE coalesce(e.deployment_status, e.status)
                         END) AS statuses
                     }
-                    CALL { MATCH (l:Location) RETURN collect(DISTINCT l.name) AS locations }
+                    CALL {
+                        MATCH (e:Employee)-[:HAS_LOCATION]->(l:Location)
+                        WHERE NOT e.name IN $managed_names
+                        RETURN collect(DISTINCT l.name) AS locations
+                    }
                     CALL { MATCH (d:Domain) RETURN collect(DISTINCT d.name) AS domains }
                     CALL { MATCH (l:Level) RETURN collect(DISTINCT l.name) AS levels }
                     CALL {
@@ -259,9 +271,9 @@ def get_filter_options():
         print(f"Error fetching filter options from Neo4j: {e}")
 
     # Merge data from pending MongoDB queue (works even when Neo4j is offline)
-    pending = get_pending_queue_data()
+    pending = get_pending_queue_data(batches)
     options['skills'] = sorted(set(options['skills']) | pending['skills'])
-    options['clients'] = sorted(set(options['clients']) | pending['clients'])
+    options['clients'] = sorted(set(options['clients']) | pending['clients'] | set(context['clients']))
     options['deploymentStatuses'] = sorted(
         set(options['deploymentStatuses']) | pending['deployment_statuses']
     )
@@ -331,7 +343,7 @@ def get_employees():
     query = "\n".join(match_clauses)
     if where_clauses:
         query += "\nWHERE " + " AND ".join(where_clauses)
-    query += "\nRETURN e"
+    query += "\nOPTIONAL MATCH (e)-[:WORKED_FOR]->(current_client:Client)\nOPTIONAL MATCH (e)-[:HAS_LOCATION]->(current_location:Location)\nRETURN e, collect(DISTINCT current_client.name) AS related_clients, collect(DISTINCT current_location.name) AS related_locations"
     
     employees = []
     repair_softblocked_deployment_status(mongo_db)
@@ -360,17 +372,21 @@ def get_employees():
                         
                     id_val = emp.get('id', emp.get('name'))
                     seen_names.add(emp.get('name', '').lower())
+                    related_clients = record.get('related_clients') or []
+                    related_locations = record.get('related_locations') or []
                     employees.append({
                         'id': id_val,
                         'name': emp.get('name'),
                         'status': emp.get('status', 'AVAILABLE'),
                         'deployment_status': 'SOFTBLOCKED' if emp.get('status') == 'SOFTBLOCKED' else emp.get('deployment_status'),
-                        'client_name': emp.get('client_name'),
+                        'client_name': emp.get('client_name') or next(iter(related_clients), None),
+                        'client_names': related_clients,
                         'current_project': emp.get('current_project'),
                         'performance': emp.get('performance'),
                         'available_since': emp.get('available_since'),
                         'bench_aging': bench_days,
-                        'location': emp.get('location'),
+                        'location': emp.get('location') or related_locations,
+                        'locations': emp.get('location') if isinstance(emp.get('location'), list) else related_locations,
                         'skills': emp.get('skills', []),
                         'softblock_job': emp.get('softblock_job'),
                         'softblock_company': emp.get('softblock_company'),
@@ -632,20 +648,41 @@ def sync_job_to_graph(job):
                 session.run("""
                     MATCH (j:Job {id: $job_id})
                     MERGE (c:Client {name: $client})
+                    ON CREATE SET c.created_by_jobs = true
                     MERGE (j)-[:FOR_CLIENT]->(c)
                 """, job_id=job['id'], client=job['client']).consume()
             if job['location']:
                 session.run("""
                     MATCH (j:Job {id: $job_id})
                     MERGE (l:Location {name: $location})
+                    ON CREATE SET l.created_by_jobs = true
                     MERGE (j)-[:IN_LOCATION]->(l)
                 """, job_id=job['id'], location=job['location']).consume()
 
 
 def delete_job_from_graph(job_id):
+    records = [record for batch in employee_record_batches() for record in batch['records']]
+    context = company_context(mongo_db, records)
     with get_neo4j_driver() as driver:
         with driver.session(database=NEO4J_DATABASE) as session:
-            session.run('MATCH (j:Job {id: $job_id}) DETACH DELETE j', job_id=job_id).consume()
+            def delete_and_clean(tx):
+                tx.run('MATCH (j:Job {id: $job_id}) DETACH DELETE j', job_id=job_id).consume()
+                removed = prune_orphan_clients(tx, context['protected_clients'], context['job_companies'])
+                prune_orphan_job_locations(tx, context)
+                return removed
+            return session.execute_write(delete_and_clean)
+
+
+def cleanup_orphan_clients():
+    records = [record for batch in employee_record_batches() for record in batch['records']]
+    context = company_context(mongo_db, records)
+    with get_neo4j_driver() as driver:
+        with driver.session(database=NEO4J_DATABASE) as session:
+            def clean(tx):
+                removed = prune_orphan_clients(tx, context['protected_clients'], context['job_companies'])
+                prune_orphan_job_locations(tx, context)
+                return removed
+            return session.execute_write(clean)
 
 
 @app.route('/jobs', methods=['GET', 'POST', 'OPTIONS'])
@@ -700,6 +737,7 @@ def add_job():
         'id': f"JOB-{uuid.uuid4().hex[:8]}", 'type': 'JOB_CREATED',
         'employee': role, 'job_description': role,
         'company_name': job['client'], 'neo4j_pending': pending,
+        'job_id': job['id'], 'location': job['location'],
         'sent_at': datetime.now(timezone.utc).isoformat(),
         'recipient': 'hr@company.com'
     })
@@ -711,6 +749,7 @@ def delete_job(job_id):
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
     if not user: return jsonify({'error': 'Unauthorized'}), 401
+    removed_clients = []
     if job_id.startswith('legacy-'):
         from bson import ObjectId
         try:
@@ -727,19 +766,30 @@ def delete_job(job_id):
         else:
             mongo_db['pending_neo4j_queue'].delete_one({'_id': queued['_id']})
         role, client = record.get('job_role', ''), record.get('client_name', '')
-        pending = False
+        location = record.get('location', '')
+        # Preserve the deleted job's scope for cleanup after an offline retry.
+        mongo_db['pending_neo4j_queue'].update_one({'type': 'job_delete', 'job_id': job_id},
+            {'$set': {'type': 'job_delete', 'job_id': job_id, 'client': client, 'location': location}}, upsert=True)
+        pending = True
+        try:
+            removed_clients = cleanup_orphan_clients()
+            mongo_db['pending_neo4j_queue'].delete_many({'type': 'job_delete', 'job_id': job_id})
+            pending = False
+        except Exception as error:
+            app.logger.warning('Company graph cleanup pending: %s', type(error).__name__)
     else:
         job = mongo_db['jobs'].find_one({'id': job_id})
         if not job: return jsonify({'error': 'Job not found.'}), 404
         role, client = job['role'], job['client']
+        location = job.get('location', '')
         # A tombstone prevents an offline graph node from returning after deletion.
         mongo_db['pending_neo4j_queue'].update_one(
             {'type': 'job_delete', 'job_id': job_id},
-            {'$set': {'type': 'job_delete', 'job_id': job_id}}, upsert=True)
+            {'$set': {'type': 'job_delete', 'job_id': job_id, 'client': client, 'location': location}}, upsert=True)
         mongo_db['jobs'].delete_one({'id': job_id})
         pending = True
         try:
-            delete_job_from_graph(job_id)
+            removed_clients = delete_job_from_graph(job_id)
             mongo_db['pending_neo4j_queue'].delete_many({'type': 'job_delete', 'job_id': job_id})
             pending = False
         except Exception as error:
@@ -747,11 +797,12 @@ def delete_job(job_id):
     mongo_db['alerts'].insert_one({
         'id': f"JOB-{uuid.uuid4().hex[:8]}", 'type': 'JOB_DELETED',
         'employee': role, 'job_description': role, 'company_name': client,
+        'job_id': job_id, 'location': location,
         'neo4j_pending': pending,
         'sent_at': datetime.now(timezone.utc).isoformat(),
         'recipient': 'hr@company.com'
     })
-    return jsonify({'status': 'success', 'neo4j_pending': pending})
+    return jsonify({'status': 'success', 'neo4j_pending': pending, 'removed_companies': removed_clients})
 
 @app.route('/alerts', methods=['GET'])
 def get_alerts():
@@ -899,6 +950,9 @@ def search_ontology():
     if not q:
         return jsonify([])
 
+    batches = list(employee_record_batches())
+    context = company_context(mongo_db, [record for batch in batches for record in batch['records']])
+
     results = []
     seen = set()
     try:
@@ -924,11 +978,27 @@ def search_ontology():
                 res2 = session.run("""
                     MATCH (n)
                     WHERE NOT n:Employee AND toLower(n.name) CONTAINS toLower($q)
-                    RETURN n.name AS name, labels(n) AS labels
+                    WITH n, EXISTS {
+                        MATCH (e:Employee)-[:WORKED_FOR|HAS_LOCATION]->(n)
+                        WHERE NOT e.name IN $managed_names
+                    } AS has_employee_reference
+                    WHERE (NOT n:Client OR n.name IN $active_clients OR has_employee_reference)
+                      AND (NOT n:Job OR n.id IN $active_job_ids)
+                      AND (NOT n:Location OR n.name IN $active_locations OR has_employee_reference)
+                    RETURN n.name AS name, labels(n) AS labels, n.id AS job_id, has_employee_reference
                     LIMIT 10
-                """, q=q)
+                """, q=q, active_clients=context['clients'], active_job_ids=context['job_ids'],
+                     managed_names=context['managed_names'], active_locations=context['protected_locations'])
                 for r in res2:
                     name = r['name']
+                    if ('Client' in r['labels'] and name not in context['clients']
+                            and not r.get('has_employee_reference')):
+                        continue
+                    if 'Job' in r['labels'] and r.get('job_id') not in context['job_ids']:
+                        continue
+                    if ('Location' in r['labels'] and name not in context['protected_locations']
+                            and not r.get('has_employee_reference')):
+                        continue
                     if name not in seen:
                         seen.add(name)
                         lbl = list(r['labels'])[0] if r['labels'] else 'Node'
@@ -944,7 +1014,7 @@ def search_ontology():
     # Also search pending MongoDB queue (ingested but Neo4j offline)
     low_q = q.lower()
     try:
-        for job in employee_record_batches():
+        for job in batches:
             for rec in job.get('records', []):
                 name = rec.get('emp_name', '')
                 if name and low_q in name.lower() and name not in seen:
@@ -958,6 +1028,11 @@ def search_ontology():
     except Exception as e:
         print(f"Pending queue search error: {e}")
 
+    for name in context['clients']:
+        if low_q in name.lower() and name not in seen:
+            results.append({'id': name, 'label': name, 'type': 'Client', 'subtext': 'Select to generate graph'})
+            seen.add(name)
+
     return jsonify(results)
 
 @app.route('/expand/<path:node>', methods=['GET', 'OPTIONS'])
@@ -966,6 +1041,8 @@ def expand_node(node):
     if request.method == 'OPTIONS': return '', 204
     user = get_current_user()
     if not user: return jsonify({"error": "Unauthorized"}), 401
+    records = [rec for batch in employee_record_batches() for rec in batch['records']]
+    context = company_context(mongo_db, records)
     nodes, links = [], []
     def graph_node(value):
         labels = list(value.labels)
@@ -979,18 +1056,39 @@ def expand_node(node):
             with driver.session(database=NEO4J_DATABASE) as session:
                 res = session.run("""
                     MATCH (n {name: $node})
+                    WITH n, EXISTS {
+                        MATCH (e:Employee)-[:WORKED_FOR|HAS_LOCATION]->(n)
+                        WHERE NOT e.name IN $managed_names
+                    } AS root_has_employee_reference
+                    WHERE (NOT n:Client OR n.name IN $active_clients OR root_has_employee_reference)
+                      AND (NOT n:Job OR n.id IN $active_job_ids)
+                      AND (NOT n:Location OR n.name IN $active_locations OR root_has_employee_reference)
                     OPTIONAL MATCH (n)-[r]-(m)
-                    RETURN n, r, m
-                """, node=node)
+                    WHERE (NOT m:Client OR m.name IN $active_clients OR EXISTS {
+                        MATCH (e:Employee)-[:WORKED_FOR|HAS_LOCATION]->(m)
+                        WHERE NOT e.name IN $managed_names
+                    }) AND (NOT m:Job OR m.id IN $active_job_ids)
+                       AND (NOT m:Location OR m.name IN $active_locations OR EXISTS {
+                           MATCH (e:Employee)-[:HAS_LOCATION]->(m)
+                           WHERE NOT e.name IN $managed_names
+                       })
+                    RETURN n, r, m, root_has_employee_reference, EXISTS {
+                        MATCH (e:Employee)-[:WORKED_FOR|HAS_LOCATION]->(m)
+                        WHERE NOT e.name IN $managed_names
+                    } AS neighbor_has_employee_reference
+                """, node=node, active_clients=context['clients'], active_job_ids=context['job_ids'],
+                     managed_names=context['managed_names'], active_locations=context['protected_locations'])
                 seen_node_ids = set()
                 seen_edges = set()
                 for rec in res:
                     n = rec['n']; m = rec['m']; r = rec['r']
+                    if not graph_node_is_current(n, context, rec.get('root_has_employee_reference', False)):
+                        continue
                     n_id = n.get('id', n.get('name'))
                     if n_id not in seen_node_ids:
                         nodes.append(graph_node(n))
                         seen_node_ids.add(n_id)
-                    if m is None or r is None:
+                    if r is None or not graph_node_is_current(m, context, rec.get('neighbor_has_employee_reference', False)):
                         continue
                     m_id = m.get('id', m.get('name'))
                     if m_id not in seen_node_ids:
@@ -1005,7 +1103,6 @@ def expand_node(node):
         print(f"Expand Neo4j error: {e}")
 
     # Overlay current MongoDB records, including changes awaiting graph sync.
-    records = [rec for batch in employee_record_batches() for rec in batch['records']]
     canonical = {rec['emp_name']: rec for rec in records if rec.get('sync_version')}
     canonical_ids = {rec['id']: rec for rec in canonical.values()}
     legacy_ids = {rec.get('id') or rec['emp_name']: rec for rec in records
@@ -1078,8 +1175,7 @@ def normalize_optional_text(value):
     return text
 
 def normalize_client_name(value):
-    name = normalize_optional_text(value)
-    return None if name and name.lower() in ('no client', 'no clients') else name
+    return normalize_company_name(value)
 
 def effective_deployment_status(record):
     if (str(record.get('status') or '').upper() == 'SOFTBLOCKED'
@@ -1265,6 +1361,8 @@ def sync_pending_neo4j():
             sync_job_to_graph(job)
             mongo_db['jobs'].update_one({'id': job['id']}, {'$set': {'neo4j_synced': True}})
             jobs_synced += 1
+        # Repair unused clients left by deletions from older application versions.
+        removed_clients = cleanup_orphan_clients()
     except Exception:
         return jsonify({'error': 'Job graph sync is pending; changes remain saved in MongoDB'}), 503
     # Mark each upload by its employees, including repeated filenames.
@@ -1284,6 +1382,7 @@ def sync_pending_neo4j():
                 {'$set': {'neo4j_synced': True}},
             )
     return jsonify({'synced': len(pending), 'jobs_synced': jobs_synced, 'jobs_deleted': jobs_deleted,
+                    'removed_companies': removed_clients,
                     'message': f'Synced {len(pending)} employees and {jobs_synced} jobs to Neo4j'})
 
 @app.route('/ingestion/clear', methods=['POST', 'OPTIONS'])

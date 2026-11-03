@@ -58,6 +58,8 @@ Select an employee in **Graph**, then choose **Edit employee** to update deploym
 
 In the Graph and Employees soft-block forms, **Company Name** lists companies with open jobs from the Jobs tab. **Job Position** lists that company's open roles. Changing the company clears the previous role; deleted or closed jobs disappear on refresh. Choose both fields before confirming. The API receives the selected company name and job position.
 
+Deleting a Jobs-tab entry removes its MongoDB record and Neo4j job node. Unused company/location nodes created by jobs are removed in the same graph transaction, while employee assignments and companies used by other jobs are preserved. Client filters use current employee/job references instead of stale graph nodes and update when the loaded jobs change. Deleted jobs/unused companies are excluded from graph search and expansion even while graph cleanup is pending. Alerts retain the job-deletion history. **Ingestion → Retry graph sync** also cleans up unused job-created companies left by older versions.
+
 If Neo4j is unavailable, the response reports `neo4j_pending: true`; the employee remains saved in MongoDB. Use **Ingestion → Retry graph sync** or authenticated `POST /ingestion/sync-pending` to retry the latest employee state. The sync version prevents an older operation from marking a newer edit synced. Upload history shows pending syncs. No background retry worker is configured.
 
 `POST /ingestion/clear` removes ingested employees, stored documents, upload history, and the graph; it retains MongoDB data if Neo4j cannot be cleared. This action requires login and clears the application's shared dataset.

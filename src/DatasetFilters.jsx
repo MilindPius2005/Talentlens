@@ -2,8 +2,9 @@ import React, { useState, useEffect } from 'react';
 import './index.css';
 import { getDeploymentStatuses } from './deploymentStatuses';
 import { getLocationOptions } from './employeeLocations';
+import { getCurrentCompanies } from './companyOptions';
 
-export default function DatasetFilters({ onFilterChange, API_BASE, employees = [] }) {
+export default function DatasetFilters({ onFilterChange, API_BASE, employees = [], jobs = [], clientDataReady = false }) {
   const [options, setOptions] = useState({
     clients: [], skills: [], levels: [], locations: [],
     deploymentStatuses: [], benchMin: 0, benchMax: 365
@@ -19,6 +20,15 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
   });
   const deploymentStatuses = getDeploymentStatuses(employees, options.deploymentStatuses || []);
   const locations = getLocationOptions(employees, options.locations || []);
+  const clients = clientDataReady ? getCurrentCompanies(employees, jobs) : options.clients;
+  const clientsKey = JSON.stringify(clients);
+
+  useEffect(() => {
+    if (!clientDataReady || !filters.client || filters.client === '__NO_CLIENT__' || clients.includes(filters.client)) return;
+    const updated = { ...filters, client: '' };
+    setFilters(updated);
+    onFilterChange(updated, benchRange);
+  }, [clientDataReady, clientsKey, filters, benchRange, onFilterChange]);
 
   useEffect(() => {
     fetch(`${API_BASE}/filter-options`, { credentials: "include" })
@@ -103,7 +113,7 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
         <select className="form-input" value={filters.client} onChange={e => handleChange('client', e.target.value)}>
           <option value="" aria-label="Clear client search"> </option>
           <option value="__NO_CLIENT__">No Clients</option>
-          {options.clients.map(c => <option key={c} value={c}>{c}</option>)}
+          {clients.map(c => <option key={c} value={c}>{c}</option>)}
         </select>
       </div>
 

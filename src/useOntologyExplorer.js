@@ -168,10 +168,10 @@ export function useOntologyExplorer(initialFilters = {}) {
       if (!res.ok) throw new Error(`Graph request failed (${res.status})`);
       const data = await parseJsonSafe(res);
       if (controller.signal.aborted || epoch !== graphEpoch.current) return;
-      setGraph(data?.nodes?.length ? data : {
-        nodes: [{ id: rootId, label: rootId, type: 'Employee' }], links: [],
-      });
-      setExpandedIds(new Set([rootId]));
+      const hasNodes = Array.isArray(data?.nodes) && data.nodes.length > 0;
+      setGraph(hasNodes ? data : { nodes: [], links: [] });
+      setExpandedIds(new Set(hasNodes ? [rootId] : []));
+      if (!hasNodes) setRootNode(null);
     } catch (error) {
       if (!controller.signal.aborted && epoch === graphEpoch.current) console.error('Failed to load graph:', error);
     } finally {

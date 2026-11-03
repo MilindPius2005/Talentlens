@@ -57,12 +57,14 @@ class EmployeePersistenceTests(unittest.TestCase):
         empty_result.__iter__.return_value = iter(())
         self.session.run.return_value = empty_result
         self.tx = MagicMock()
+        self.tx.run.return_value.single.return_value = {'removed_clients': []}
         self.projected = []
 
         def write(callback, *args):
-            callback(self.tx, *args)
+            result = callback(self.tx, *args)
             if args:
                 self.projected.extend(args[0])
+            return result
 
         self.session.execute_write.side_effect = write
         self.driver = MagicMock()
@@ -450,7 +452,7 @@ class EmployeePersistenceTests(unittest.TestCase):
         self.assertEqual(self.client.get('/jobs').json, [])
         self.assertIsNone(self.db.jobs.find_one({'id': job_id}))
         self.assertEqual(self.db.alerts.find_one({'type': 'JOB_DELETED'})['job_description'], 'Engineer')
-        self.assertTrue(any('DETACH DELETE j' in call.args[0] for call in self.session.run.call_args_list))
+        self.assertTrue(any('DETACH DELETE j' in call.args[0] for call in self.tx.run.call_args_list))
 
     def test_offline_job_delete_stays_deleted_and_graph_retry_clears_tombstone(self):
         self.offline()
@@ -476,6 +478,84 @@ class EmployeePersistenceTests(unittest.TestCase):
         self.assertEqual(job['role'], 'Designer')
         self.assertEqual(self.client.delete(f"/jobs/{job['id']}").status_code, 200)
         self.assertEqual(self.db.pending_neo4j_queue.count_documents({'type': 'job'}), 0)
+
+    def test_deleted_job_only_company_disappears_offline_and_history_is_kept(self):
+        self.offline()
+        job = self.client.post('/jobs', json={'role': 'Engineer', 'client': 'playsimple', 'location': 'Job-only city'}).json['job']
+        self.assertEqual(self.client.get('/filter-options').json['clients'], ['playsimple'])
+        self.client.delete('/jobs/' + job['id'])
+        self.assertEqual(self.client.get('/filter-options').json['clients'], [])
+        self.assertEqual(self.client.get('/search?q=playsimple').json, [])
+        self.assertEqual(self.db.alerts.count_documents({'type': 'JOB_DELETED'}), 1)
+        pending = self.db.pending_neo4j_queue.find_one({'type': 'job_delete'})
+        self.assertEqual(pending['client'], 'playsimple')
+        self.assertEqual(pending['location'], 'Job-only city')
+
+    def test_company_survives_until_last_job_is_deleted(self):
+        first = self.client.post('/jobs', json={'role': 'Engineer', 'client': 'Acme'}).json['job']
+        second = self.client.post('/jobs', json={'role': 'Analyst', 'client': 'Acme'}).json['job']
+        self.client.delete('/jobs/' + first['id'])
+        self.assertEqual(self.client.get('/filter-options').json['clients'], ['Acme'])
+        cleanup = [call for call in self.tx.run.call_args_list if 'MATCH (c:Client)' in call.args[0]][-1]
+        self.assertIn('Acme', cleanup.kwargs['protected_clients'])
+        self.client.delete('/jobs/' + second['id'])
+        self.assertEqual(self.client.get('/filter-options').json['clients'], [])
+        cleanup = [call for call in self.tx.run.call_args_list if 'MATCH (c:Client)' in call.args[0]][-1]
+        self.assertNotIn('Acme', cleanup.kwargs['protected_clients'])
+        self.assertIn('Acme', cleanup.kwargs['job_companies'])
+
+    def test_job_delete_preserves_employee_company_assignment(self):
+        self.upload()
+        job = self.client.post('/jobs', json={'role': 'Engineer', 'client': 'Acme'}).json['job']
+        self.client.delete('/jobs/' + job['id'])
+        self.assertEqual(find_employee(self.db, 'Alice')['client_name'], 'Acme')
+        self.assertEqual(self.client.get('/filter-options').json['clients'], ['Acme'])
+        cleanup = [call for call in self.tx.run.call_args_list if 'MATCH (c:Client)' in call.args[0]][-1]
+        self.assertIn('Acme', cleanup.kwargs['protected_clients'])
+
+    def test_stale_deleted_company_cannot_be_searched_or_expanded(self):
+        self.session.run.side_effect = [[], [{'name': 'playsimple', 'labels': ['Client'], 'has_employee_reference': False}]]
+        self.assertEqual(self.client.get('/search?q=playsimple').json, [])
+        class ClientNode(dict):
+            labels = ['Client']
+        self.session.run.side_effect = None
+        self.session.run.return_value.__iter__.return_value = iter([
+            {'n': ClientNode(name='playsimple'), 'm': None, 'r': None, 'root_has_employee_reference': False},
+        ])
+        self.assertEqual(self.client.get('/expand/playsimple').json, {'nodes': [], 'links': []})
+
+    def test_existing_legacy_employee_company_stays_visible_in_graph(self):
+        class ClientNode(dict):
+            labels = ['Client']
+        self.session.run.return_value.__iter__.return_value = iter([
+            {'n': ClientNode(name='Legacy Client'), 'm': None, 'r': None, 'root_has_employee_reference': True},
+        ])
+        self.assertEqual(self.client.get('/expand/Legacy%20Client').json['nodes'][0]['label'], 'Legacy Client')
+
+    def test_deleted_job_only_location_cannot_be_searched_or_expanded(self):
+        self.session.run.side_effect = [[], [{'name': 'Job-only city', 'labels': ['Location'], 'has_employee_reference': False}]]
+        self.assertEqual(self.client.get('/search?q=Job-only').json, [])
+        class LocationNode(dict):
+            labels = ['Location']
+        self.session.run.side_effect = None
+        self.session.run.return_value.__iter__.return_value = iter([
+            {'n': LocationNode(name='Job-only city'), 'm': None, 'r': None, 'root_has_employee_reference': False},
+        ])
+        self.assertEqual(self.client.get('/expand/Job-only%20city').json, {'nodes': [], 'links': []})
+
+    def test_retry_repairs_old_job_company_orphans_without_employee_updates(self):
+        self.db.alerts.insert_many([
+            {'type': 'JOB_CREATED', 'company_name': 'playsimple'},
+            {'type': 'JOB_DELETED', 'company_name': 'tower of research'},
+        ])
+        self.tx.run.return_value.single.return_value = {'removed_clients': ['playsimple', 'tower of research']}
+        response = self.client.post('/ingestion/sync-pending')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json['removed_companies'], ['playsimple', 'tower of research'])
+        self.assertEqual(self.db.alerts.count_documents({}), 2)
+        cleanup = [call for call in self.tx.run.call_args_list if 'MATCH (c:Client)' in call.args[0]][-1]
+        self.assertEqual(cleanup.kwargs['job_companies'], ['playsimple', 'tower of research'])
+        self.assertIn('c.created_by_jobs', cleanup.args[0])
 
 
 if __name__ == '__main__':

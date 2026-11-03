@@ -1,5 +1,5 @@
 // @ts-nocheck — This legacy component uses dynamic JavaScript data shapes.
-import { lazy, memo, Suspense, useCallback, useState, useEffect, useRef } from "react";
+import { lazy, memo, Suspense, useCallback, useMemo, useState, useEffect, useRef } from "react";
 import * as d3 from "d3";
 import DatasetFilters from './DatasetFilters';
 import SearchBar from './SearchBar';
@@ -9,6 +9,7 @@ import { startPolling, reuseUnchangedRows } from './polling';
 import SoftblockJobFields from './SoftblockJobFields';
 import { isOpenJobSelection } from './openJobs';
 import { getEmployeeLocations, getLocationValues } from './employeeLocations';
+import { getCurrentCompanies, getReferencedLocations, pruneDeletedJobNodes } from './companyOptions';
 
 const OntologyGraph = lazy(() => import('./OntologyGraph'));
 
@@ -1440,7 +1441,7 @@ function Ingestion({ user }) {
   );
 }
 
-const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees, setAlerts }) {
+const GraphView = memo(function GraphView({ user, employees, jobs, clientDataReady, setEmployees, setAlerts }) {
   const {
     searchQuery,
     setSearchQuery,
@@ -1480,6 +1481,28 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
   const [editingEmployee, setEditingEmployee] = useState(null);
   const [savingEmployee, setSavingEmployee] = useState(false);
   const [employeeMessage, setEmployeeMessage] = useState("");
+  const currentCompanies = useMemo(() => getCurrentCompanies(employees, jobs), [employees, jobs]);
+  const currentLocations = useMemo(() => getReferencedLocations(employees, jobs), [employees, jobs]);
+  useEffect(() => {
+    if (!clientDataReady) return;
+    const updated = pruneDeletedJobNodes(graph, currentCompanies, jobs, employees);
+    const root = graph.nodes.find(node => node.id === rootNode || node.label === rootNode);
+    if (root && !updated.nodes.includes(root)) {
+      clearExplorer();
+      setFilterFeedback(null);
+      return;
+    }
+    if (updated !== graph) setGraph(updated);
+    const results = searchResults.filter(result =>
+      (result.type !== 'Client' || currentCompanies.includes(result.label || result.id)) &&
+      (result.type !== 'Location' || currentLocations.includes(result.label || result.id)) &&
+      (result.type !== 'Job' || jobs.some(job => job.id === result.id || job.role === (result.label || result.id))));
+    if (results.length !== searchResults.length) {
+      setSearchResults(results);
+      if (!results.some(result => result.id === pendingGraphRoot)) setPendingGraphRoot(results[0]?.id || null);
+    }
+    setSelectedNode(previous => previous?.type === 'Client' && !currentCompanies.includes(previous.label || previous.id) ? null : previous);
+  }, [clientDataReady, currentCompanies, currentLocations, employees, jobs, graph, rootNode, searchResults, pendingGraphRoot, clearExplorer, setGraph, setSearchResults, setPendingGraphRoot, setSelectedNode]);
   const deploymentStatuses = getDeploymentStatuses(
     employees, [selectedNode?.deployment_status, editingEmployee?.deployment_status]
   );
@@ -1653,7 +1676,7 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
 
   return (
     <div style={{ display: "flex", height: "calc(100vh - 108px)" }}>
-      <DatasetFilters onFilterChange={handleFilterChange} API_BASE={API_BASE} employees={employees} />
+      <DatasetFilters onFilterChange={handleFilterChange} API_BASE={API_BASE} employees={employees} jobs={jobs} clientDataReady={clientDataReady} />
       
       <div style={{ display: "flex", flexDirection: "column", flex: 1, paddingLeft: 24, overflow: "hidden" }}>
         <div className="page-header" style={{ marginBottom: 12 }}>
@@ -1923,6 +1946,9 @@ export default function TalentLens() {
       await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "include" });
       setUser(null);
       setJobs([]);
+      setJobsLoaded(false);
+      setEmployeesLoaded(false);
+      setApiConnected(false);
       setAlerts([]);
       knownAlertIds.current = null;
       setNewAlertToast(null);
@@ -1940,6 +1966,8 @@ export default function TalentLens() {
   const [notifiedExpiries, setNotifiedExpiries] = useState([]);
   const [tick, setTick] = useState(0);
   const [apiConnected, setApiConnected] = useState(false);
+  const [jobsLoaded, setJobsLoaded] = useState(false);
+  const [employeesLoaded, setEmployeesLoaded] = useState(false);
 
   useEffect(() => {
     if (!knownAlertIds.current) return;
@@ -1983,6 +2011,7 @@ export default function TalentLens() {
       }
       await Promise.allSettled([
         read("/employees", apiEmployees => {
+          setEmployeesLoaded(true);
           const ids = new Set(apiEmployees.map(employee => employee.id));
           const names = new Set(apiEmployees.map(employee => employee.name));
           setEmployees(previous => reuseUnchangedRows(previous, [
@@ -2013,7 +2042,10 @@ export default function TalentLens() {
           }
           setAlerts(previous => reuseUnchangedRows(previous, apiAlerts));
         }),
-        read("/jobs", savedJobs => setJobs(previous => reuseUnchangedRows(previous, savedJobs))),
+        read("/jobs", savedJobs => {
+          setJobs(previous => reuseUnchangedRows(previous, savedJobs));
+          setJobsLoaded(true);
+        }),
       ]);
     });
   }, [user]);
@@ -2159,7 +2191,7 @@ export default function TalentLens() {
             {page === "jobs" && <Jobs jobs={jobs} setJobs={setJobs} employees={employees} />}
             {page === "interviews" && <Interviews employees={employees} setEmployees={setEmployees} />}
             {page === "alerts" && <Alerts employees={employees} alerts={alerts} onUnblock={handleUnblockFromAlert} onSnooze={handleSnoozeFromAlert} />}
-            {page === "graph" && <GraphView user={user} employees={employees} jobs={jobs} setEmployees={setEmployees} setAlerts={setAlerts} />}
+            {page === "graph" && <GraphView user={user} employees={employees} jobs={jobs} clientDataReady={employeesLoaded && jobsLoaded} setEmployees={setEmployees} setAlerts={setAlerts} />}
             {page === "ingestion" && <Ingestion user={user} />}
           </div>
         </div>
