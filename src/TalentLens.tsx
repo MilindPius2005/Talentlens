@@ -1465,6 +1465,7 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
   const filterRequestId = useRef(0);
   const filterController = useRef(null);
   const filterTimer = useRef(null);
+  const [filterFeedback, setFilterFeedback] = useState(null);
   useEffect(() => () => {
     clearTimeout(filterTimer.current);
     filterController.current?.abort();
@@ -1494,6 +1495,7 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
     filterRequestId.current++;
     clearTimeout(filterTimer.current);
     filterController.current?.abort();
+    setFilterFeedback(null);
     setSearchQuery(query);
   }
 
@@ -1535,7 +1537,8 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
     clearTimeout(filterTimer.current);
     filterController.current?.abort();
     setFilters({ ...filters, ...benchRange });
-    setSearchQuery('');
+    // A graph from the previous selection must not appear as a new match.
+    clearExplorer();
     const params = new URLSearchParams();
     if (benchRange.min > 0) params.append('benchMin', benchRange.min);
     if (benchRange.max < 365) params.append('benchMax', benchRange.max);
@@ -1547,19 +1550,20 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
     // Check if any filter is actually active
     const hasFilter = [...params.keys()].some(k => !['benchMin','benchMax'].includes(k)) || params.has('benchMin') || params.has('benchMax');
     if (clearSearch || !hasFilter) {
-      // No filters active – clear filter results and reset the graph
-      clearExplorer();
+      setFilterFeedback(null);
       return;
     }
 
+    setFilterFeedback({ loading: true });
     const controller = new AbortController();
     filterController.current = controller;
     filterTimer.current = setTimeout(async () => {
       try {
         const res = await fetch(`${API_BASE}/employees?${params.toString()}`, { credentials: "include", signal: controller.signal });
-        if (!res.ok || requestId !== filterRequestId.current) return;
-        const employees = (await parseJsonSafe(res)) || [];
-        if (requestId !== filterRequestId.current) return;
+        if (!res.ok) throw new Error('Unable to load matching employees. Please try the filters again.');
+        const employees = await parseJsonSafe(res);
+        if (controller.signal.aborted || requestId !== filterRequestId.current) return;
+        if (!Array.isArray(employees)) throw new Error('Unable to load matching employees. Please try the filters again.');
         // Map employees into search-result cards (same shape as /search)
         const results = employees.slice(0, 20).map(e => ({
           id: e.name || e.id,
@@ -1570,8 +1574,11 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
         setSearchResults(results);
         if (results.length > 0) setPendingGraphRoot(results[0].id);
         else setPendingGraphRoot(null);
+        setFilterFeedback({ loading: false, total: employees.length });
       } catch (err) {
-        if (!controller.signal.aborted) console.error("Filter fetch error:", err);
+        if (!controller.signal.aborted && requestId === filterRequestId.current) {
+          setFilterFeedback({ loading: false, error: err.message || 'Unable to load matching employees. Please try again.' });
+        }
       }
     }, 180);
   }
@@ -1657,8 +1664,17 @@ const GraphView = memo(function GraphView({ user, employees, jobs, setEmployees,
               pendingGraphRoot={pendingGraphRoot}
               onSelectResult={selectSearchResult}
               onGenerateGraph={generateKnowledgeGraph}
-              isLoading={isLoading}
+              isLoading={isLoading || filterFeedback?.loading}
             />
+            {filterFeedback && (
+              <div role={filterFeedback.error ? 'alert' : 'status'} style={{ marginTop: 10, fontSize: 13, color: filterFeedback.error ? T.red : T.slate }}>
+                {filterFeedback.loading ? 'Finding matching employees…' : filterFeedback.error || (
+                  filterFeedback.total === 0
+                    ? 'No employees match all selected filters. Remove a skill or adjust the other filters.'
+                    : `${filterFeedback.total} matching employee${filterFeedback.total === 1 ? '' : 's'}${filterFeedback.total > 20 ? ' — showing the first 20' : ''}.`
+                )}
+              </div>
+            )}
           </div>
         </div>
 

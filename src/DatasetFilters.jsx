@@ -58,6 +58,12 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
     onFilterChange(newFilters, benchRange);
   };
 
+  const clearSkills = () => {
+    const newFilters = { ...filters, skills: [] };
+    setFilters(newFilters);
+    onFilterChange(newFilters, benchRange);
+  };
+
   const handleReset = () => {
     const emptyFilters = {
       client: "",
@@ -117,22 +123,33 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
 
       <div>
         <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Skills (Multi-Select AND)</label>
+        <div style={{ fontSize: 12, color: '#4B5563', marginBottom: 8 }}>
+          Employees must have every selected skill.
+        </div>
+        {filters.skills.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
+            <span style={{ fontSize: 12, color: '#0A7C88', fontWeight: 600 }}>{filters.skills.length} selected</span>
+            <button type="button" onClick={clearSkills} style={{ background: 'none', color: '#0A7C88', fontSize: 12, textDecoration: 'underline' }}>Clear skills</button>
+          </div>
+        )}
         <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
           {options.skills.length === 0 && <span style={{ color: "#4B5563", fontSize: 13 }}>No skills available</span>}
           {options.skills.map(s => (
-            <div 
+            <button
+              type="button"
               key={s} 
+              aria-pressed={filters.skills.includes(s)}
               onClick={() => toggleSkill(s)}
               style={{
                 padding: "4px 8px", borderRadius: "12px", fontSize: "12px", cursor: "pointer",
-                background: filters.skills.includes(s) ? "var(--primary)" : "#F7F8FA",
+                background: filters.skills.includes(s) ? "#0A7C88" : "#F7F8FA",
                 color: filters.skills.includes(s) ? "#fff" : "#4B5563",
                 border: "1px solid",
-                borderColor: filters.skills.includes(s) ? "var(--primary)" : "#E2E6EF",
+                borderColor: filters.skills.includes(s) ? "#0A7C88" : "#E2E6EF",
               }}
             >
               {s}
-            </div>
+            </button>
           ))}
         </div>
       </div>
