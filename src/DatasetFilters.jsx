@@ -126,7 +126,7 @@ export default function DatasetFilters({ onFilterChange, API_BASE, employees = [
       </div>
 
       <div>
-        <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Deployment Status</label>
+        <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Status</label>
         <select className="form-input" value={filters.status} onChange={e => handleChange('status', e.target.value)}>
           <option value="">All Statuses</option>
           {deploymentStatuses.map(status => (
