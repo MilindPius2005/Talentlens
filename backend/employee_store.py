@@ -11,8 +11,10 @@ from pymongo.errors import CollectionInvalid
 
 if __package__:
     from .location_store import normalize_locations
+    from .employee_status import client_name, project_name, employee_status_fields
 else:
     from location_store import normalize_locations
+    from employee_status import client_name, project_name, employee_status_fields
 
 
 LIST_FIELDS = ('skills', 'misc_skills', 'domain', 'location', 'level')
@@ -62,16 +64,14 @@ def save_import(db, records, owner, upload_id):
     for record in records:
         fields = {key: record.get(key) for key in TEXT_FIELDS
                   if not key.startswith('softblock_')}
-        client_name = fields.get('client_name')
-        if not client_name or str(client_name).strip().lower() in ('na', 'n/a', 'none', 'null', 'nan', 'no client', 'no clients'):
-            fields['client_name'] = None
-            if not fields.get('deployment_status'):
-                fields['deployment_status'] = 'AVAILABLE'
+        fields['client_name'] = client_name(fields.get('client_name'))
+        fields['current_project'] = project_name(fields.get('current_project'))
         fields.update({key: record.get(key, []) for key in LIST_FIELDS})
         fields['location'] = normalize_locations(fields['location'])
         existing = db['employees'].find_one({'emp_name': record['emp_name']}, {'status': 1})
         if (existing or record).get('status') == 'SOFTBLOCKED':
             fields['deployment_status'] = 'SOFTBLOCKED'
+        fields.update(employee_status_fields({**record, **fields}))
         db['employees'].update_one(
             {'emp_name': record['emp_name']},
             {'$set': {
@@ -80,7 +80,7 @@ def save_import(db, records, owner, upload_id):
                 'sync_version': uuid4().hex, 'schema_version': 2,
             }, '$setOnInsert': {
                 'id': record['emp_name'], 'emp_name': record['emp_name'],
-                'status': record.get('status') or 'AVAILABLE', 'created_at': now,
+                'created_at': now,
                 **{key: record.get(key) for key in TEXT_FIELDS if key.startswith('softblock_')},
             }}, upsert=True,
         )
@@ -91,8 +91,21 @@ def find_employee(db, identifier):
 
 
 def update_employee(db, identifier, changes):
+    existing = find_employee(db, identifier)
+    if not existing:
+        return None
+    changes = dict(changes)
     if 'location' in changes:
-        changes = {**changes, 'location': normalize_locations(changes['location'])}
+        changes['location'] = normalize_locations(changes['location'])
+    if 'client_name' in changes:
+        changes['client_name'] = client_name(changes['client_name'])
+    if 'current_project' in changes:
+        changes['current_project'] = project_name(changes['current_project'])
+    current = {**existing, **changes}
+    if 'deployment_status' in changes:
+        # A deliberate deployment edit supersedes the legacy workflow flag.
+        current['sync_version'] = 'editing'
+    changes.update(employee_status_fields(current))
     ensure_employee_schema(db)
     return db['employees'].find_one_and_update(
         {'$or': [{'id': identifier}, {'emp_name': identifier}]},
@@ -151,7 +164,7 @@ def sync_employees(db, driver_factory, database, employees):
         properties = {key: employee.get(key) for key in TEXT_FIELDS}
         properties.update({key: employee.get(key, []) for key in LIST_FIELDS})
         properties.update(id=employee['id'], name=employee['emp_name'],
-                          status=employee['status'], owner=employee.get('owner'))
+                          owner=employee.get('owner'), **employee_status_fields(employee))
         records.append({
             'emp_name': employee['emp_name'], 'properties': properties,
             **{key: employee.get(key, []) for key in LIST_FIELDS},
@@ -175,8 +188,9 @@ def sync_employees(db, driver_factory, database, employees):
 
 def public_employee(employee):
     result = {key: value for key, value in employee.items() if key != '_id'}
-    if result.get('status') != 'SOFTBLOCKED' and not result.get('deployment_status') and not result.get('client_name'):
-        result['deployment_status'] = 'AVAILABLE'
+    result.update(employee_status_fields(employee))
+    result['client_name'] = client_name(employee.get('client_name'))
+    result['current_project'] = project_name(employee.get('current_project'))
     result['name'] = employee['emp_name']
     result['neo4j_pending'] = not employee.get('neo4j_synced', False)
     result['locations'] = employee.get('location', [])

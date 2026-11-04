@@ -162,7 +162,8 @@ export function useOntologyExplorer(initialFilters = {}) {
     setExpandedIds(new Set());
     setIsLoadingGraph(true);
     try {
-      const res = await fetch(`${API_BASE}/expand/${encodeURIComponent(rootId)}`, {
+      const statusQuery = filters.status ? `?status=${encodeURIComponent(filters.status)}` : '';
+      const res = await fetch(`${API_BASE}/expand/${encodeURIComponent(rootId)}${statusQuery}`, {
         credentials: 'include', signal: controller.signal,
       });
       if (!res.ok) throw new Error(`Graph request failed (${res.status})`);
@@ -180,7 +181,7 @@ export function useOntologyExplorer(initialFilters = {}) {
         setIsLoadingGraph(graphControllers.current.size > 0);
       }
     }
-  }, [abortGraphRequests]);
+  }, [abortGraphRequests, filters.status]);
 
   const generateKnowledgeGraph = useCallback(() => {
     if (pendingGraphRoot) return loadGraph(pendingGraphRoot);
@@ -195,7 +196,8 @@ export function useOntologyExplorer(initialFilters = {}) {
     graphControllers.current.set(nodeId, controller);
     setIsLoadingGraph(true);
     try {
-      const res = await fetch(`${API_BASE}/expand/${encodeURIComponent(nodeId)}`, {
+      const statusQuery = filters.status ? `?status=${encodeURIComponent(filters.status)}` : '';
+      const res = await fetch(`${API_BASE}/expand/${encodeURIComponent(nodeId)}${statusQuery}`, {
         credentials: 'include', signal: controller.signal,
       });
       if (!res.ok) throw new Error(`Graph request failed (${res.status})`);
@@ -213,7 +215,7 @@ export function useOntologyExplorer(initialFilters = {}) {
         setIsLoadingGraph(graphControllers.current.size > 0);
       }
     }
-  }, [mergeGraphs]);
+  }, [mergeGraphs, filters.status]);
 
   // Step 5: Collapse an expanded node using BFS reachable analysis
   const collapseNodeInGraph = useCallback((node) => {

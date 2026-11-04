@@ -4,7 +4,7 @@ import * as d3 from "d3";
 import DatasetFilters from './DatasetFilters';
 import SearchBar from './SearchBar';
 import { useOntologyExplorer } from './useOntologyExplorer';
-import { getDeploymentStatuses } from './deploymentStatuses';
+import { getDeploymentStatuses, reconcileEmployeeGraph } from './deploymentStatuses';
 import { startPolling, reuseUnchangedRows } from './polling';
 import SoftblockJobFields from './SoftblockJobFields';
 import { isOpenJobSelection } from './openJobs';
@@ -430,7 +430,7 @@ function EmployeeDetail({ emp, jobs, user, onClose, onUpdate, setAlerts }) {
           onUpdate({
             ...emp,
             ...resData?.employee,
-            status: action === "softblock" ? "SOFTBLOCKED" : "AVAILABLE",
+            status: resData?.employee?.status || (action === "softblock" ? "SOFTBLOCKED" : "AVAILABLE"),
             deployment_status: resData?.employee?.deployment_status || (action === "softblock" ? "SOFTBLOCKED" : "AVAILABLE"),
             softblock_job: action === "softblock" ? payload.job_position : null,
             softblock_company: action === "softblock" ? payload.company_name : null,
@@ -1461,6 +1461,7 @@ const GraphView = memo(function GraphView({ user, employees, jobs, clientDataRea
     isLoading,
     selectedNode,
     setSelectedNode,
+    filters,
     setFilters,
     clearExplorer,
   } = useOntologyExplorer();
@@ -1507,6 +1508,14 @@ const GraphView = memo(function GraphView({ user, employees, jobs, clientDataRea
     employees, [selectedNode?.deployment_status, editingEmployee?.deployment_status]
   );
 
+  useEffect(() => {
+    setGraph(previous => reconcileEmployeeGraph(previous, employees, filters.status, rootNode));
+    setSelectedNode(previous => {
+      if (!previous || previous.type !== 'Employee') return previous;
+      return reconcileEmployeeGraph({ nodes: [previous], links: [] }, employees, filters.status).nodes[0] || null;
+    });
+  }, [employees, filters.status, rootNode, setGraph, setSelectedNode]);
+
   const selectEmployeeNode = useCallback((node) => {
     const employee = employees.find(emp => emp.id === node.id || emp.name === node.label);
     setSelectedNode({ ...node, ...employee });
@@ -1526,10 +1535,21 @@ const GraphView = memo(function GraphView({ user, employees, jobs, clientDataRea
   }
 
   function applySavedEmployee(employee) {
+    const matchesEmployee = value => value.id === employee.id || value.name === employee.name || value.label === employee.name;
+    const matchesStatus = !filters.status || employee.deployment_status === filters.status;
     setEmployees(prev => prev.map(emp => emp.id === employee.id || emp.name === employee.name ? employee : emp));
-    setSelectedNode(prev => prev ? { ...prev, ...employee } : prev);
-    setGraph(prev => ({ ...prev, nodes: prev.nodes.map(node =>
-      node.id === employee.id || node.label === employee.name ? { ...node, ...employee } : node) }));
+    setSelectedNode(prev => prev && matchesEmployee(prev) ? (matchesStatus ? { ...prev, ...employee } : null) : prev);
+    setGraph(prev => {
+      const nodes = prev.nodes.flatMap(node => matchesEmployee(node) ? (matchesStatus ? [{ ...node, ...employee }] : []) : [node]);
+      const ids = new Set(nodes.map(node => node.id));
+      const nodeId = value => typeof value === 'object' ? value.id : value;
+      const links = prev.links.filter(link => ids.has(nodeId(link.source)) && ids.has(nodeId(link.target)));
+      return { ...prev, nodes, links };
+    });
+    if (!matchesStatus) {
+      setSearchResults(prev => prev.filter(result => !matchesEmployee(result)));
+      setPendingGraphRoot(prev => prev === employee.id || prev === employee.name ? null : prev);
+    }
   }
 
   async function saveEmployee(event) {
@@ -1547,7 +1567,8 @@ const GraphView = memo(function GraphView({ user, employees, jobs, clientDataRea
       applySavedEmployee(data.employee);
       setEditingEmployee(null);
       // Refresh visible relationships after a client or project assignment changes.
-      const graphRes = await fetch(`${API_BASE}/expand/${encodeURIComponent(rootNode)}`, { credentials: "include" });
+      const statusQuery = filters.status ? `?status=${encodeURIComponent(filters.status)}` : '';
+      const graphRes = await fetch(`${API_BASE}/expand/${encodeURIComponent(rootNode)}${statusQuery}`, { credentials: "include" });
       const updatedGraph = await parseJsonSafe(graphRes);
       if (graphRes.ok && updatedGraph?.nodes) setGraph(updatedGraph);
       setEmployeeMessage(data.neo4j_pending ? "Saved. Graph sync is pending." : "Employee saved.");
@@ -2083,20 +2104,22 @@ export default function TalentLens() {
 
   async function handleUnblockFromAlert(alert) {
     const empIdentifier = alert.employee_id || alert.employee;
+    let savedEmployee;
     try {
       const res = await fetch(`${API_BASE}/employees/${encodeURIComponent(empIdentifier)}/release`, { method: "POST", credentials: "include" });
       const data = await parseJsonSafe(res);
       if (!res.ok) throw new Error(data?.error || "Release failed");
+      savedEmployee = data.employee;
       setAlerts(prev => [data.alert, ...prev.filter(a => a.id !== data.alert.id)]);
     } catch (error) {
       window.alert(error.message);
       return;
     }
     setEmployees(prev => prev.map(e => (e.id === empIdentifier || e.name === alert.employee)
-      ? { ...e, status:"AVAILABLE", softblock_job:null, softblock_company:null, softblock_manager:null, softblock_start:null, softblock_expiry:null }
+      ? { ...e, ...savedEmployee }
       : e));
     setGraphEmployees(prev => prev.map(e => (e.id === empIdentifier || e.name === alert.employee)
-      ? { ...e, status:"AVAILABLE", softblock_job:null, softblock_company:null, softblock_manager:null, softblock_start:null, softblock_expiry:null }
+      ? { ...e, ...savedEmployee }
       : e));
   }
 

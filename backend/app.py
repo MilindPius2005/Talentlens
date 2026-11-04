@@ -12,12 +12,14 @@ from dotenv import load_dotenv
 from gridfs import GridFS
 
 if __package__:
+    from .employee_status import effective_deployment_status, employee_status_fields, project_name as normalize_project_name
     from .location_store import normalize_location
     from .company_store import company_context, graph_node_is_current, normalize_company_name, prune_orphan_clients, prune_orphan_job_locations
     from .neo4j_pool import Neo4jPool
     from .employee_store import (LIST_FIELDS, save_import, find_employee, update_employee,
                                  sync_employees, public_employee, repair_softblocked_deployment_status)
 else:
+    from employee_status import effective_deployment_status, employee_status_fields, project_name as normalize_project_name
     from location_store import normalize_location
     from company_store import company_context, graph_node_is_current, normalize_company_name, prune_orphan_clients, prune_orphan_job_locations
     from neo4j_pool import Neo4jPool
@@ -241,9 +243,12 @@ def get_filter_options():
                     }
                     CALL {
                         MATCH (e:Employee) WHERE NOT e.name IN $managed_names
-                        RETURN collect(DISTINCT CASE WHEN toUpper(e.status) = 'SOFTBLOCKED'
-                            THEN 'SOFTBLOCKED' ELSE coalesce(e.deployment_status, e.status)
-                        END) AS statuses
+                        RETURN collect(DISTINCT {
+                            status: e.status, deployment_status: e.deployment_status,
+                            client_name: e.client_name, current_project: e.current_project,
+                            client_names: [(e)-[:WORKED_FOR]->(c:Client) | c.name],
+                            projects: [(e)-[:WORKS_ON]->(p:Project) | p.name]
+                        }) AS statuses
                     }
                     CALL {
                         MATCH (e:Employee)-[:HAS_LOCATION]->(l:Location)
@@ -262,7 +267,7 @@ def get_filter_options():
                     for key in ('skills', 'clients', 'locations', 'domains', 'levels'):
                         options[key] = sorted(value for value in record[key] if normalize_optional_text(value))
                     options['deploymentStatuses'] = sorted(
-                        value.upper() for value in record['statuses'] if normalize_optional_text(value)
+                        {effective_deployment_status(value) for value in record['statuses']}
                     )
                     if record['oldest']:
                         oldest_date = datetime.strptime(record['oldest'], '%Y-%m-%d').replace(tzinfo=timezone.utc)
@@ -324,14 +329,8 @@ def get_employees():
     if level:
         match_clauses.append("MATCH (e)-[:HAS_LEVEL]->(:Level {name: $level})")
         params['level'] = level
-    if status:
-        normalized_status = status.strip().upper()
-        where_clauses.append("""
-            toUpper(trim(CASE WHEN toUpper(e.status) = 'SOFTBLOCKED'
-                THEN 'SOFTBLOCKED' ELSE coalesce(e.deployment_status, e.status)
-            END)) = $status
-        """)
-        params['status'] = normalized_status
+    # Apply status after reading assignment properties AND legacy relationships.
+    # A stored AVAILABLE default alone is insufficient to establish availability.
     if search:
         where_clauses.append("toLower(e.name) CONTAINS toLower($search)")
         params['search'] = search
@@ -345,7 +344,12 @@ def get_employees():
     query = "\n".join(match_clauses)
     if where_clauses:
         query += "\nWHERE " + " AND ".join(where_clauses)
-    query += "\nOPTIONAL MATCH (e)-[:WORKED_FOR]->(current_client:Client)\nOPTIONAL MATCH (e)-[:HAS_LOCATION]->(current_location:Location)\nRETURN e, collect(DISTINCT current_client.name) AS related_clients, collect(DISTINCT current_location.name) AS related_locations"
+    query += """
+        RETURN DISTINCT e,
+            [(e)-[:WORKED_FOR]->(c:Client) | c.name] AS related_clients,
+            [(e)-[:HAS_LOCATION]->(l:Location) | l.name] AS related_locations,
+            [(e)-[:WORKS_ON]->(p:Project) | p.name] AS related_projects
+    """
     
     employees = []
     repair_softblocked_deployment_status(mongo_db)
@@ -372,18 +376,25 @@ def get_employees():
                     if bench_min is not None and bench_days < bench_min: continue
                     if bench_max is not None and bench_days > bench_max: continue
                         
-                    id_val = emp.get('id', emp.get('name'))
-                    seen_names.add(emp.get('name', '').lower())
                     related_clients = record.get('related_clients') or []
                     related_locations = record.get('related_locations') or []
+                    related_projects = record.get('related_projects') or []
+                    status_fields = employee_status_fields({
+                        **emp, 'client_names': related_clients, 'projects': related_projects,
+                    })
+                    if status and status.strip().upper() != status_fields['deployment_status']:
+                        continue
+                    id_val = emp.get('id', emp.get('name'))
+                    seen_names.add(emp.get('name', '').lower())
                     employees.append({
                         'id': id_val,
                         'name': emp.get('name'),
-                        'status': emp.get('status', 'AVAILABLE'),
-                        'deployment_status': 'SOFTBLOCKED' if emp.get('status') == 'SOFTBLOCKED' else emp.get('deployment_status'),
-                        'client_name': emp.get('client_name') or next(iter(related_clients), None),
+                        **status_fields,
+                        'client_name': normalize_client_name(emp.get('client_name')) or next(
+                            (name for value in related_clients if (name := normalize_client_name(value))), None),
                         'client_names': related_clients,
-                        'current_project': emp.get('current_project'),
+                        'current_project': normalize_project_name(emp.get('current_project')) or next(
+                            (name for value in related_projects if (name := normalize_project_name(value))), None),
                         'performance': emp.get('performance'),
                         'available_since': emp.get('available_since'),
                         'bench_aging': bench_days,
@@ -442,10 +453,9 @@ def get_employees():
                 employees.append({
                     'id': emp_name,
                     'name': emp_name,
-                    'status': rec.get('status') or ('AVAILABLE' if not rec_client else None),
-                    'deployment_status': rec_status or None,
+                    **employee_status_fields(rec),
                     'client_name': rec_client,
-                    'current_project': rec.get('current_project'),
+                    'current_project': normalize_project_name(rec.get('current_project')),
                     'performance': rec.get('performance'),
                     'available_since': avail_date_str,
                     'bench_aging': bench_days,
@@ -1047,12 +1057,14 @@ def expand_node(node):
     records = [rec for batch in employee_record_batches() for rec in batch['records']]
     context = company_context(mongo_db, records)
     nodes, links = [], []
-    def graph_node(value):
+    def graph_node(value, clients=None, projects=None):
         labels = list(value.labels)
         item = {'id': value.get('id', value.get('name')), 'label': value.get('name'), 'type': labels[0] if labels else 'Node'}
         if 'Employee' in labels:
-            for field in ('status', 'available_since', 'softblock_job', 'softblock_company', 'softblock_manager', 'softblock_start', 'softblock_expiry'):
+            for field in ('status', 'deployment_status', 'client_name', 'current_project', 'available_since', 'softblock_job', 'softblock_company', 'softblock_manager', 'softblock_start', 'softblock_expiry'):
                 item[field] = value.get(field)
+            item['client_names'] = clients or []
+            item['projects'] = projects or []
         return item
     try:
         with get_neo4j_driver() as driver:
@@ -1078,7 +1090,11 @@ def expand_node(node):
                     RETURN n, r, m, root_has_employee_reference, EXISTS {
                         MATCH (e:Employee)-[:WORKED_FOR|HAS_LOCATION]->(m)
                         WHERE NOT e.name IN $managed_names
-                    } AS neighbor_has_employee_reference
+                    } AS neighbor_has_employee_reference,
+                    [(n)-[:WORKED_FOR]->(c:Client) | c.name] AS root_clients,
+                    [(n)-[:WORKS_ON]->(p:Project) | p.name] AS root_projects,
+                    [(m)-[:WORKED_FOR]->(c:Client) | c.name] AS neighbor_clients,
+                    [(m)-[:WORKS_ON]->(p:Project) | p.name] AS neighbor_projects
                 """, node=node, active_clients=context['clients'], active_job_ids=context['job_ids'],
                      managed_names=context['managed_names'], active_locations=context['protected_locations'])
                 seen_node_ids = set()
@@ -1089,13 +1105,13 @@ def expand_node(node):
                         continue
                     n_id = n.get('id', n.get('name'))
                     if n_id not in seen_node_ids:
-                        nodes.append(graph_node(n))
+                        nodes.append(graph_node(n, rec.get('root_clients'), rec.get('root_projects')))
                         seen_node_ids.add(n_id)
                     if r is None or not graph_node_is_current(m, context, rec.get('neighbor_has_employee_reference', False)):
                         continue
                     m_id = m.get('id', m.get('name'))
                     if m_id not in seen_node_ids:
-                        nodes.append(graph_node(m))
+                        nodes.append(graph_node(m, rec.get('neighbor_clients'), rec.get('neighbor_projects')))
                         seen_node_ids.add(m_id)
                     source, target = (n_id, m_id) if r.nodes[0] == n else (m_id, n_id)
                     edge_key = (source, target, r.type)
@@ -1144,6 +1160,12 @@ def expand_node(node):
                         link_keys.add(edge_key)
         if is_root:
             node_map[employee_id] = {'id': employee_id, 'label': name, 'type': 'Employee'}
+    graph_assignments = {}
+    for link in links:
+        field = {'WORKED_FOR': 'client_names', 'WORKS_ON': 'projects'}.get(link['type'])
+        if field:
+            assignments = graph_assignments.setdefault(link['source'], {'client_names': [], 'projects': []})
+            assignments[field].append(node_map.get(link['target'], {}).get('label'))
     for entry in node_map.values():
         employee = canonical_ids.get(entry['id']) or canonical.get(entry.get('label'))
         if entry.get('type') == 'Employee' and employee:
@@ -1151,16 +1173,37 @@ def expand_node(node):
             entry.update(label=employee['emp_name'], type='Employee')
         elif entry.get('type') == 'Employee' and entry['id'] in legacy_ids:
             legacy = legacy_ids[entry['id']]
-            entry.update(status=legacy.get('status') or 'AVAILABLE',
-                         deployment_status=effective_deployment_status(legacy),
+            entry.update(**employee_status_fields(legacy),
                          client_name=normalize_client_name(legacy.get('client_name')),
+                         current_project=normalize_project_name(legacy.get('current_project')),
                          softblock_job=legacy.get('softblock_job'),
                          softblock_company=legacy.get('softblock_company'))
+        elif entry.get('type') == 'Employee':
+            assignments = {'client_names': list(entry.get('client_names') or []),
+                           'projects': list(entry.get('projects') or [])}
+            for field, values in graph_assignments.get(entry['id'], {}).items():
+                assignments[field].extend(values)
+            entry.update(employee_status_fields({**entry, **assignments}))
+            entry['client_name'] = normalize_client_name(entry.get('client_name')) or next(
+                (name for value in assignments['client_names'] if (name := normalize_client_name(value))), None)
+            entry['current_project'] = normalize_project_name(entry.get('current_project')) or next(
+                (name for value in assignments['projects'] if (name := normalize_project_name(value))), None)
     connected = {node}
     for link in links:
         connected.update((link['source'], link['target']))
     nodes = [entry for entry in node_map.values()
              if entry['id'] in connected or entry.get('label') == node]
+    requested_status = (request.args.get('status') or '').strip().upper()
+    if requested_status:
+        root = next((entry for entry in nodes if node in (entry['id'], entry.get('label'))), None)
+        if root and root.get('type') == 'Employee' and root['deployment_status'] != requested_status:
+            return jsonify({'nodes': [], 'links': []})
+        nodes = [entry for entry in nodes if entry.get('type') != 'Employee'
+                 or entry['deployment_status'] == requested_status]
+        kept_ids = {entry['id'] for entry in nodes}
+        links = [link for link in links if link['source'] in kept_ids and link['target'] in kept_ids]
+        connected = {endpoint for link in links for endpoint in (link['source'], link['target'])}
+        nodes = [entry for entry in nodes if entry['id'] in connected or entry is root]
     return jsonify({'nodes': nodes, 'links': links})
 
 def parse_skills(s):
@@ -1179,20 +1222,6 @@ def normalize_optional_text(value):
 
 def normalize_client_name(value):
     return normalize_company_name(value)
-
-def effective_deployment_status(record):
-    if (str(record.get('status') or '').upper() == 'SOFTBLOCKED'
-            and not record.get('sync_version')):
-        return 'SOFTBLOCKED'
-    explicit = normalize_optional_text(record.get('deployment_status'))
-    if explicit:
-        return explicit.upper()
-    if str(record.get('status') or '').upper() == 'SOFTBLOCKED':
-        return 'SOFTBLOCKED'
-    if not normalize_client_name(record.get('client_name')):
-        return 'AVAILABLE'
-    status = normalize_optional_text(record.get('status'))
-    return status.upper() if status else None
 
 def get_ingested_value(row, aliases):
     columns = {re.sub(r'[^a-z0-9]', '', str(column).lower()): column for column in row.index}
@@ -1258,7 +1287,7 @@ def upload_file():
         rec = {
             'emp_name': ename,
             'client_name': client_name,
-            'deployment_status': deployment_status.upper() if deployment_status else ('AVAILABLE' if client_name is None else None),
+            'deployment_status': deployment_status.upper() if deployment_status else None,
             'current_project': normalize_optional_text(get_ingested_value(row, ['Current_Project', 'Current_Projects', 'Project', 'Projects'])),
             'performance': normalize_optional_text(get_ingested_value(row, ['Performance'])),
             'skills': parse_skills(row.get('Skills')),

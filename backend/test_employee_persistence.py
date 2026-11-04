@@ -18,6 +18,7 @@ from backend.employee_store import EMPLOYEE_SCHEMA, find_employee, project_emplo
 
 
 CSV = b'Emp_Name,Client_Name,Skills,misc skill,Deployment Status,Current Project,Performance,Location\nAlice,Acme,Python,SQL,DEPLOYED,Migration,Good,London\n'
+AVAILABLE_CSV = CSV.replace(b'Alice,Acme,', b'Alice,,').replace(b'DEPLOYED,Migration', b'AVAILABLE,')
 
 
 class EmployeePersistenceTests(unittest.TestCase):
@@ -124,7 +125,7 @@ class EmployeePersistenceTests(unittest.TestCase):
         self.upload()
         self.session.run.reset_mock()
         self.session.run.return_value.single.return_value = {
-            'skills': ['GraphQL'], 'clients': ['Other'], 'statuses': ['TRAINING'],
+            'skills': ['GraphQL'], 'clients': ['Other'], 'statuses': [{'deployment_status': 'TRAINING'}],
             'locations': ['Remote'], 'domains': ['Cloud'], 'levels': ['Senior'], 'oldest': None,
         }
         response = self.client.get('/filter-options')
@@ -140,6 +141,7 @@ class EmployeePersistenceTests(unittest.TestCase):
         self.assertTrue(response.json['mongo_saved'])
         employee = find_employee(self.db, 'Alice')
         self.assertEqual(employee['deployment_status'], 'DEPLOYED')
+        self.assertEqual(employee['status'], 'DEPLOYED')
         self.assertEqual(employee['skills'], ['Python'])
         self.assertTrue(employee['neo4j_synced'])
         self.assertEqual(self.schema_calls, [{'$jsonSchema': EMPLOYEE_SCHEMA}])
@@ -227,7 +229,7 @@ class EmployeePersistenceTests(unittest.TestCase):
         self.assertEqual(self.client.get('/employees').json[0]['deployment_status'], 'AVAILABLE')
 
     def test_softblock_snooze_release_persist_even_offline(self):
-        self.upload()
+        self.upload(AVAILABLE_CSV)
         self.offline()
         response = self.client.post('/employees/Alice/softblock', json={'job_label': 'Job', 'company_name': 'Acme', 'manager_name': 'Manager'})
         self.assertEqual(response.status_code, 200)
@@ -333,7 +335,7 @@ class EmployeePersistenceTests(unittest.TestCase):
         self.assertEqual(self.db['fs.files'].count_documents({}), 0)
 
     def test_softblock_moves_available_employee_between_deployment_filters(self):
-        self.upload(CSV.replace(b'DEPLOYED', b'AVAILABLE'))
+        self.upload(AVAILABLE_CSV)
         self.assertEqual([employee['name'] for employee in self.client.get('/employees?status=AVAILABLE').json], ['Alice'])
         self.client.post('/employees/Alice/softblock', json={'job_label': 'Job', 'company_name': 'Acme'})
         self.assertEqual(self.client.get('/employees?status=AVAILABLE').json, [])
@@ -351,6 +353,7 @@ class EmployeePersistenceTests(unittest.TestCase):
         rows = api.pd.concat([rows] * len(statuses), ignore_index=True)
         rows['Emp_Name'] = [f'Employee {index}' for index in range(len(statuses))]
         rows['Deployment Status'] = statuses
+        rows.loc[rows['Deployment Status'] == 'Available', ['Client_Name', 'Current Project']] = None
         file = BytesIO()
         rows.to_excel(file, index=False, engine='openpyxl')
         file.seek(0)
@@ -384,6 +387,156 @@ class EmployeePersistenceTests(unittest.TestCase):
         filtered = self.client.get('/employees?status=AVAILABLE&client=__NO_CLIENT__').json
         self.assertEqual({employee['name'] for employee in filtered},
                          {'No Client Available', 'No Client Blank Status'})
+
+    def test_available_requires_no_assignment_and_respects_other_statuses(self):
+        rows = [
+            ('Bench', None, None, 'AVAILABLE'),
+            ('Blank bench', None, None, None),
+            ('Placeholders', ' NULL ', ' n/a ', 'available'),
+            ('No assignment labels', 'No Clients', 'No Projects', 'AVAILABLE'),
+            ('Deployed without client', None, None, 'DEPLOYED'),
+            ('Client only', 'Acme', None, None),
+            ('Project only', None, 'Migration', None),
+            ('Stale available client', 'Acme', None, 'AVAILABLE'),
+            ('Stale available project', None, 'Migration', 'AVAILABLE'),
+            ('Training', None, None, 'Training'),
+            ('On leave', None, None, 'On Leave'),
+        ]
+        data = api.pd.DataFrame(rows, columns=['Emp_Name', 'Client_Name', 'Current Project', 'Deployment Status'])
+        data['Skills'], data['misc skill'] = 'Python', 'SQL'
+        self.offline()
+        self.assertEqual(self.upload(data.to_csv(index=False).encode()).status_code, 200)
+        available = {'Bench', 'Blank bench', 'Placeholders', 'No assignment labels'}
+        self.assertEqual({emp['name'] for emp in self.client.get('/employees?status=AVAILABLE').json}, available)
+        deployed = {'Deployed without client', 'Client only', 'Project only',
+                    'Stale available client', 'Stale available project'}
+        self.assertEqual({emp['name'] for emp in self.client.get('/employees?status=DEPLOYED').json}, deployed)
+        for employee in self.db.employees.find():
+            if employee['emp_name'] in available:
+                self.assertEqual(employee['status'], 'AVAILABLE')
+                self.assertIsNone(employee['client_name'])
+                self.assertIsNone(employee['current_project'])
+            elif employee['emp_name'] in deployed:
+                self.assertEqual(employee['status'], 'DEPLOYED')
+                self.assertEqual(employee['deployment_status'], 'DEPLOYED')
+        self.assertEqual(self.client.get('/employees?status=TRAINING').json[0]['name'], 'Training')
+        self.assertEqual(self.client.get('/employees?status=ON%20LEAVE').json[0]['name'], 'On leave')
+        self.online()
+        self.assertEqual(self.client.post('/ingestion/sync-pending').status_code, 200)
+        self.assertEqual({emp['name'] for emp in self.client.get('/employees?status=AVAILABLE').json}, available)
+
+    def test_old_available_defaults_do_not_leak_before_reingestion(self):
+        self.upload()
+        # Reproduce existing data written before status/assignment consistency.
+        self.db.employees.update_one({'emp_name': 'Alice'}, {'$set': {
+            'status': 'AVAILABLE', 'deployment_status': None,
+        }})
+        self.offline()
+        self.assertEqual(self.client.get('/employees?status=AVAILABLE').json, [])
+        employee = self.client.get('/employees?status=DEPLOYED').json[0]
+        self.assertEqual(employee['status'], 'DEPLOYED')
+        self.assertEqual(employee['client_name'], 'Acme')
+        self.assertEqual(employee['current_project'], 'Migration')
+        self.assertEqual(self.client.get('/filter-options').json['deploymentStatuses'], ['DEPLOYED'])
+        graph = self.client.get('/expand/Alice').json
+        self.assertEqual(next(node for node in graph['nodes'] if node['id'] == 'Alice')['status'], 'DEPLOYED')
+
+    def test_reupload_cannot_restore_available_while_assigned(self):
+        stale_sheet = CSV.replace(b'DEPLOYED', b'AVAILABLE')
+        self.offline()
+        for _ in range(2):
+            self.assertEqual(self.upload(stale_sheet).status_code, 200)
+            self.assertEqual(self.client.get('/employees?status=AVAILABLE').json, [])
+            self.assertEqual(find_employee(self.db, 'Alice')['deployment_status'], 'DEPLOYED')
+        self.client.put('/employees/Alice', json={
+            'deployment_status': 'AVAILABLE', 'client_name': None, 'current_project': None,
+        })
+        self.assertEqual(self.client.get('/employees?status=AVAILABLE').json[0]['name'], 'Alice')
+        self.upload(stale_sheet)
+        self.assertEqual(self.client.get('/employees?status=AVAILABLE').json, [])
+        self.assertEqual(self.db.employees.count_documents({'emp_name': 'Alice'}), 1)
+
+    def test_available_edits_must_clear_both_assignments(self):
+        self.upload()
+        self.offline()
+        partial = self.client.put('/employees/Alice', json={'deployment_status': 'AVAILABLE', 'client_name': None})
+        self.assertEqual(partial.status_code, 200)
+        self.assertEqual(partial.json['employee']['deployment_status'], 'DEPLOYED')
+        self.assertEqual(partial.json['employee']['current_project'], 'Migration')
+        self.assertEqual(self.client.get('/employees?status=AVAILABLE').json, [])
+        cleared = self.client.put('/employees/Alice', json={'deployment_status': 'AVAILABLE', 'current_project': 'NULL'})
+        self.assertEqual(cleared.json['employee']['status'], 'AVAILABLE')
+        self.assertEqual(self.client.get('/employees?status=AVAILABLE').json[0]['name'], 'Alice')
+        # Assigning a project again must remove this employee from the bench.
+        assigned = self.client.put('/employees/Alice', json={'current_project': 'New project'})
+        self.assertEqual(assigned.json['employee']['deployment_status'], 'DEPLOYED')
+        self.assertEqual(find_employee(self.db, 'Alice')['status'], 'DEPLOYED')
+        self.assertEqual(self.client.get('/employees?status=AVAILABLE').json, [])
+
+    def test_legacy_queue_project_is_not_inferred_available_without_client(self):
+        self.db.pending_neo4j_queue.insert_one({'records': [{
+            'emp_name': 'Legacy Project', 'status': 'AVAILABLE',
+            'deployment_status': None, 'client_name': None, 'current_project': 'Migration',
+        }]})
+        self.offline()
+        self.assertEqual(self.client.get('/employees?status=AVAILABLE').json, [])
+        self.assertEqual(self.client.get('/employees?status=DEPLOYED').json[0]['name'], 'Legacy Project')
+
+    def test_neo4j_relationship_only_assignments_are_excluded_from_available(self):
+        records = [
+            {'e': {'name': 'Legacy Client', 'status': 'AVAILABLE'}, 'related_clients': ['Acme']},
+            {'e': {'name': 'Legacy Project', 'status': 'AVAILABLE'}, 'related_projects': ['Migration']},
+            {'e': {'name': 'Explicit Deployed', 'status': 'AVAILABLE', 'deployment_status': 'DEPLOYED'}},
+            {'e': {'name': 'Legacy Bench', 'status': 'AVAILABLE'},
+             'related_clients': ['NULL'], 'related_projects': ['None']},
+        ]
+        self.session.run.return_value.__iter__.side_effect = lambda: iter(records)
+        available = self.client.get('/employees?status=AVAILABLE').json
+        self.assertEqual([emp['name'] for emp in available], ['Legacy Bench'])
+        deployed = self.client.get('/employees?status=DEPLOYED').json
+        self.assertEqual({emp['name'] for emp in deployed}, {'Legacy Client', 'Legacy Project', 'Explicit Deployed'})
+
+    def test_graph_expansion_honors_status_and_latest_offline_edits(self):
+        self.upload(AVAILABLE_CSV)
+        self.upload(CSV.replace(b'Alice', b'Bob'))
+        self.offline()
+        graph = self.client.get('/expand/Python?status=AVAILABLE').json
+        self.assertEqual({node['id'] for node in graph['nodes'] if node['type'] == 'Employee'}, {'Alice'})
+        self.assertTrue(all(link['source'] != 'Bob' and link['target'] != 'Bob' for link in graph['links']))
+        self.assertEqual(self.client.get('/expand/Bob?status=AVAILABLE').json, {'nodes': [], 'links': []})
+        deployed = self.client.get('/expand/Python?status=DEPLOYED').json
+        self.assertEqual({node['id'] for node in deployed['nodes'] if node['type'] == 'Employee'}, {'Bob'})
+        self.client.put('/employees/Alice', json={'current_project': 'New assignment'})
+        graph = self.client.get('/expand/Python?status=AVAILABLE').json
+        self.assertFalse(any(node['type'] == 'Employee' for node in graph['nodes']))
+
+    def test_graph_checks_legacy_assignments_outside_visible_neighborhood(self):
+        class Node(dict):
+            def __init__(self, label, **values):
+                super().__init__(values)
+                self.labels = [label]
+        skill = Node('Skill', name='Python')
+        employee = Node('Employee', name='Legacy Project', status='AVAILABLE')
+        relation = MagicMock()
+        relation.nodes, relation.type = [employee, skill], 'HAS_SKILL'
+        # The project is not a direct neighbor of the skill being expanded.
+        records = [{'n': skill, 'r': relation, 'm': employee, 'neighbor_projects': ['Migration']}]
+        self.session.run.return_value.__iter__.side_effect = lambda: iter(records)
+        available = self.client.get('/expand/Python?status=AVAILABLE').json
+        self.assertEqual(available, {'nodes': [{'id': 'Python', 'label': 'Python', 'type': 'Skill'}], 'links': []})
+        deployed = self.client.get('/expand/Python?status=DEPLOYED').json
+        self.assertIn('Legacy Project', {node['id'] for node in deployed['nodes']})
+
+    def test_neo4j_filter_options_use_assignment_aware_statuses(self):
+        self.session.run.return_value.single.return_value = {
+            'skills': [], 'clients': [], 'locations': [], 'domains': [], 'levels': [], 'oldest': None,
+            'statuses': [
+                {'status': 'AVAILABLE', 'projects': ['Migration']},
+                {'status': 'DEPLOYED', 'client_name': None},
+                {'deployment_status': 'ON LEAVE', 'client_name': None},
+            ],
+        }
+        self.assertEqual(self.client.get('/filter-options').json['deploymentStatuses'], ['DEPLOYED', 'ON LEAVE'])
 
     def test_legacy_no_client_queue_maps_to_available_and_migrates(self):
         self.db.pending_neo4j_queue.insert_one({
